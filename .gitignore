@@ -5,6 +5,11 @@ build/
 dist/
 wheels/
 *.egg-info
+data/
+mlruns/
 
 # Virtual environments
 .venv
+
+mlflow.d
+mlflow.db
