@@ -15,6 +15,7 @@ dependencies = [
     "gymnasium[box2d]>=1.2.3",
     "jax[cuda13]>=0.9.2",
     "jaxtyping>=0.3.9",
+    "magiccube>=1.2.0",
     "matplotlib>=3.10.8",
     "mlflow>=3.10.1",
     "numpy>=2.4.4",
