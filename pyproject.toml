@@ -24,7 +24,6 @@ dependencies = [
     "orbax-checkpoint>=0.11.35",
     "psutil>=7.2.2",
     "swig>=4.4.1",
-    "torch>=2.11.0",
     "tqdm>=4.67.3",
 ]
 
