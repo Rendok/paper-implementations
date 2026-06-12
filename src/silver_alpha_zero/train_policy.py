@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 
 # Trainer and inference server are two JAX processes sharing one GPU, so disable
 # greedy preallocation before JAX is imported anywhere in this process.
@@ -12,6 +13,7 @@ import mlflow
 import numpy as np
 import optax
 import magiccube
+import orbax.checkpoint as ocp
 
 from flax import nnx
 from jaxtyping import Array, Float, Int
@@ -21,6 +23,95 @@ from replay_buffer import ReplayBuffer
 from rubik_cube_solver import RubikCubeModel, RubikCubeState
 from inference_server import run_inference_server
 from self_play_worker import run_worker
+
+
+class AsyncEval:
+    """Fire-and-forget greedy (``tau=0``) evaluation on the self-play workers.
+
+    ``dispatch`` broadcasts an eval request and returns immediately. Workers run
+    their share of the trials between self-play episodes and stream results back
+    on ``eval_result_queue``. ``collect`` is polled (non-blocking) each training
+    iteration and returns aggregated metrics only once every trial for the
+    in-flight request has arrived, so gradient steps never stall on evaluation.
+    """
+
+    def __init__(
+        self,
+        command_queues: list,
+        eval_result_queue,
+        eval_trials: int,
+        eval_seed_base: int,
+    ):
+        self._command_queues = command_queues
+        self._eval_result_queue = eval_result_queue
+        self._eval_trials = eval_trials
+        self._eval_seed_base = eval_seed_base
+        self._sync_id: int | None = None
+        self._lengths: list[int] = []
+        self._solved: list[float] = []
+
+    @property
+    def busy(self) -> bool:
+        return self._sync_id is not None
+
+    def dispatch(self, sync_id: int) -> None:
+        """Broadcast an eval request to all workers (returns immediately)."""
+        if self.busy:
+            return  # an eval is still running; don't overlap requests
+        self._sync_id = sync_id
+        self._lengths.clear()
+        self._solved.clear()
+        for command_queue in self._command_queues:
+            command_queue.put(("eval", sync_id, self._eval_seed_base, self._eval_trials))
+
+    def collect(self) -> tuple[int, dict[str, float]] | None:
+        """Drain finished trials; return ``(step, metrics)`` once all arrive."""
+        if not self.busy:
+            return None
+        while True:
+            try:
+                sync_id, length, solved = self._eval_result_queue.get_nowait()
+            except pyqueue.Empty:
+                break
+            if sync_id != self._sync_id:
+                continue  # stale result from a previous request
+            self._lengths.append(length)
+            self._solved.append(float(solved))
+
+        if len(self._lengths) < self._eval_trials:
+            return None
+
+        step = self._sync_id
+        metrics = {
+            "eval/greedy_avg_trajectory_length": float(np.mean(self._lengths)),
+            "eval/greedy_solved_rate": float(np.mean(self._solved)),
+        }
+        self._sync_id = None
+        return step, metrics
+
+
+def _max_trajectory_for_depth(depth: int) -> int:
+    return depth * 5
+
+
+def _max_trajectory_schedule(scramble_depth_schedule: dict[int, int]) -> dict[int, int]:
+    return {
+        step: _max_trajectory_for_depth(depth)
+        for step, depth in scramble_depth_schedule.items()
+    }
+
+
+def _set_scramble_depth(command_queues: list, depth: int, train_step: int) -> None:
+    """Push curriculum settings to all self-play workers and log them."""
+    max_trajectory = _max_trajectory_for_depth(depth)
+    for command_queue in command_queues:
+        command_queue.put(("set_scramble_depth", depth, max_trajectory))
+    mlflow.log_metric("curriculum/scramble_depth", depth, step=train_step)
+    mlflow.log_metric("curriculum/max_trajectory", max_trajectory, step=train_step)
+    print(
+        f"train_step {train_step}: scramble_depth -> {depth}, "
+        f"max_trajectory -> {max_trajectory}"
+    )
 
 
 def _policy_loss(
@@ -45,13 +136,15 @@ def _train_step(
     states: Int[Array, "batch state_dim"],
     target_actions: Float[Array, "batch action_dim"],
     target_values: Float[Array, "batch"],
-) -> tuple[Float[Array, ""], Float[Array, ""], Float[Array, ""]]:
+) -> tuple[Float[Array, ""], Float[Array, ""], Float[Array, ""], Float[Array, ""]]:
     """One JIT-compiled gradient step; mutates policy and optimizer in place."""
     (loss, (policy_ce, value_mse)), grads = nnx.value_and_grad(_policy_loss, has_aux=True)(
         policy, states, target_actions, target_values
     )
+    # Pre-clip global gradient norm, so the clip threshold can be set from data.
+    grad_norm = optax.global_norm(grads)
     optimizer.update(policy, grads)
-    return loss, policy_ce, value_mse
+    return loss, policy_ce, value_mse, grad_norm
 
 
 def _extract_weights(policy: Policy) -> dict:
@@ -59,6 +152,25 @@ def _extract_weights(policy: Policy) -> dict:
     multiprocessing queue to the inference server."""
     pure = nnx.state(policy).to_pure_dict()
     return jax.tree.map(lambda x: np.asarray(x), pure)
+
+
+def _create_checkpoint_manager(
+    directory: str | Path, *, max_to_keep: int = 5
+) -> ocp.CheckpointManager:
+    directory = Path(directory).expanduser().resolve()
+    directory.mkdir(parents=True, exist_ok=True)
+    options = ocp.CheckpointManagerOptions(max_to_keep=max_to_keep, create=True)
+    return ocp.CheckpointManager(directory, options=options)
+
+
+def _save_policy_checkpoint(
+    manager: ocp.CheckpointManager, policy: Policy, step: int
+) -> Path:
+    """Persist the live policy (same weights pushed to the target) at ``step``."""
+    state = nnx.state(policy)
+    manager.save(step, args=ocp.args.StandardSave(state))
+    manager.wait_until_finished()
+    return Path(manager.directory) / str(step)
 
 
 def train_policy(
@@ -84,9 +196,15 @@ def train_policy(
     request_queue = ctx.Queue()
     weight_queue = ctx.Queue()
     result_queue = ctx.Queue()
+    eval_result_queue = ctx.Queue()
     response_queues = [ctx.Queue() for _ in range(config["num_workers"])]
+    command_queues = [ctx.Queue() for _ in range(config["num_workers"])]
     stop_event = ctx.Event()
     ready_event = ctx.Event()
+    checkpoint_manager = _create_checkpoint_manager(
+        config["checkpoint_dir"],
+        max_to_keep=config.get("checkpoint_max_to_keep", 5),
+    )
 
     sp_config = {
         "cube_size": config["cube_size"],
@@ -122,7 +240,17 @@ def train_policy(
     workers = [
         ctx.Process(
             target=run_worker,
-            args=(i, request_queue, response_queues[i], result_queue, stop_event, sp_config),
+            args=(
+                i,
+                request_queue,
+                response_queues[i],
+                result_queue,
+                command_queues[i],
+                eval_result_queue,
+                stop_event,
+                sp_config,
+                config["num_workers"],
+            ),
             daemon=True,
         )
         for i in range(config["num_workers"])
@@ -134,8 +262,30 @@ def train_policy(
     recent_solved: list[float] = []
     train_step = 0
     train_budget = 0.0
+    scramble_depth_schedule = config.get("scramble_depth_schedule", {})
+
+    # async_eval = AsyncEval(
+    #     command_queues,
+    #     eval_result_queue,
+    #     config["eval_trials"],
+    #     config["eval_seed_base"],
+    # )
+    # async_eval.dispatch(sync_id=train_step)  # baseline eval at step 0
     try:
         while train_step < config["total_training_steps"]:
+            # Pick up any finished evaluation without blocking gradient steps.
+            # done = async_eval.collect()
+            # if done is not None:
+            #     eval_step, eval_metrics = done
+            #     mlflow.log_metrics(eval_metrics, step=eval_step)
+
+            if train_step in scramble_depth_schedule:
+                _set_scramble_depth(
+                    command_queues,
+                    scramble_depth_schedule[train_step],
+                    train_step,
+                )
+
             # Drain freshly produced self-play episodes into the replay buffer.
             new_examples = 0
             for _ in range(config["ingest_budget"]):
@@ -166,7 +316,7 @@ def train_policy(
                 continue
 
             states, target_actions, target_values = replay_buffer.sample(config["batch_size"])
-            loss, policy_ce, value_mse = _train_step(
+            loss, policy_ce, value_mse, grad_norm = _train_step(
                 policy, optimizer, states, target_actions, target_values
             )
             train_budget -= 1.0
@@ -175,6 +325,7 @@ def train_policy(
                     "train/loss": float(loss),
                     "train/policy_cross_entropy": float(policy_ce),
                     "train/value_mse": float(value_mse),
+                    "train/grad_norm": float(grad_norm),
                     "train/train_budget": train_budget,
                 },
                 step=train_step,
@@ -196,6 +347,11 @@ def train_policy(
             train_step += 1
             if train_step % config["target_sync_steps"] == 0:
                 weight_queue.put(_extract_weights(policy))
+                checkpoint_path = _save_policy_checkpoint(
+                    checkpoint_manager, policy, train_step
+                )
+                # async_eval.dispatch(sync_id=train_step)
+                print(f"saved target checkpoint step {train_step} -> {checkpoint_path}")
     finally:
         stop_event.set()
         for worker in workers:
@@ -216,21 +372,31 @@ if __name__ == "__main__":
     replay_ratio=2.0 → 2 grad steps per 32 new states"""
 
     config = {
-        "batch_size": 32,
-        "total_training_steps": 1000,
-        "cube_size": 2,
-        "scramble_depth": 2,
-        "max_trajectory": 10,
-        "num_simulation_rollouts": 500,
-        "tau": 1.0,
-        "c_puct": 5.0,
-        "discount": 0.99,
-        "num_workers": 32,
-        "target_sync_steps": 10,
+        "batch_size": 32, # training
         "max_inference_batch": 64,
+        "total_training_steps": 2000,
+        "cube_size": 2,
+        "scramble_depth": 4,
+        "scramble_depth_schedule": {
+            # 150: 4,
+            1000: 8,
+        },
+        "max_trajectory": _max_trajectory_for_depth(2),
+        "num_simulation_rollouts": 1000,
+        "tau": 1.0,
+        "c_puct": 1.5,
+        "discount": 0.99,
+        "num_workers": 64,
+        "target_sync_steps": 60,
+        "eval_trials": 32,
+        "eval_seed_base": 100_000,
         "ingest_budget": 64,
-        "replay_ratio": 0.5,
+        "replay_ratio": 1.0,
         "seed_base": 0,
+        "grad_clip_norm": 10.0,  # loose guard for spikes; tune via train/grad_norm
+        "buffer_capacity": 2**13,
+        "checkpoint_dir": "checkpoints/silver_alpha_zero",
+        "checkpoint_max_to_keep": 5,
     }
     rules_model = RubikCubeModel(config["cube_size"])
 
@@ -242,17 +408,34 @@ if __name__ == "__main__":
         "num_embeddings": len(magiccube.Color),
         "state_dim": state_dim,
         "action_dim": action_dim,
-        "embed_dim": 128,
-        "num_transformer_blocks": 8,
-        "num_heads": 2,
+        "embed_dim": 256,
+        "num_transformer_blocks": 16,
+        "num_heads": 4,
         "seed": 0,
     }
     policy = Policy(rngs=nnx.Rngs(policy_config["seed"]), **{k: policy_config[k] for k in ("num_embeddings", "state_dim", "action_dim", "embed_dim", "num_transformer_blocks", "num_heads")})
 
-    optimizer = nnx.Optimizer(policy, optax.adam(learning_rate=0.001), wrt=nnx.Param)
-    replay_buffer = ReplayBuffer(capacity=2048, state_dim=state_dim, action_dim=action_dim, rngs=nnx.Rngs(1))
+    schedule_fn = optax.warmup_cosine_decay_schedule(
+        init_value=0.0,            # Learning rate at start of warmup
+        peak_value=1e-4,           # Maximum learning rate
+        warmup_steps=50,         # Steps to reach peak value
+        decay_steps=config["total_training_steps"],         # Steps for the cosine decay phase
+        end_value=0.0,             # Final learning rate
+    )
+    # tx = optax.chain(
+    #     optax.clip_by_global_norm(config["grad_clip_norm"]),
+    #     optax.adamw(learning_rate=schedule_fn),
+    # )
+    tx = optax.adamw(learning_rate=schedule_fn)
+    optimizer = nnx.Optimizer(policy, tx, wrt=nnx.Param)
+    replay_buffer = ReplayBuffer(capacity=config["buffer_capacity"], state_dim=state_dim, action_dim=action_dim, rngs=nnx.Rngs(1))
 
     mlflow.set_experiment("silver_alpha_zero")
     with mlflow.start_run(run_name="rubik_cube_alpha_zero", log_system_metrics=True):
+        schedule = config.pop("scramble_depth_schedule", {})
+        max_trajectory_schedule = _max_trajectory_schedule(schedule)
         mlflow.log_params(config)
+        mlflow.log_param("scramble_depth_schedule", str(schedule))
+        mlflow.log_param("max_trajectory_schedule", str(max_trajectory_schedule))
+        config["scramble_depth_schedule"] = schedule
         train_policy(policy, optimizer, replay_buffer, config, policy_config)

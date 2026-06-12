@@ -28,12 +28,20 @@ class TransformerBlock(nnx.Module):
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.attention = nnx.MultiHeadAttention(
-            in_features=embed_dim, num_heads=num_heads, decode=False, rngs=rngs
+            in_features=embed_dim,
+            num_heads=num_heads,
+            decode=False,
+            use_bias=False,
+            rngs=rngs,
         )
-        self.linear1 = nnx.Linear(in_features=embed_dim, out_features=4 * embed_dim, rngs=rngs)
-        self.linear2 = nnx.Linear(in_features=4 * embed_dim, out_features=embed_dim, rngs=rngs)
-        self.norm1 = nnx.LayerNorm(embed_dim, rngs=rngs)
-        self.norm2 = nnx.LayerNorm(embed_dim, rngs=rngs)
+        self.linear1 = nnx.Linear(
+            in_features=embed_dim, out_features=4 * embed_dim, use_bias=False, rngs=rngs
+        )
+        self.linear2 = nnx.Linear(
+            in_features=4 * embed_dim, out_features=embed_dim, use_bias=False, rngs=rngs
+        )
+        self.norm1 = nnx.RMSNorm(embed_dim, rngs=rngs)
+        self.norm2 = nnx.RMSNorm(embed_dim, rngs=rngs)
 
     def __call__(self, x: Float[Array, "... embed_dim"]) -> Float[Array, "... embed_dim"]:
         # Pre-norm self-attention with residual connection.
@@ -58,12 +66,21 @@ class Policy(nnx.Module):
         self.action_dim = action_dim
         # Each input index (e.g. a sticker color in [0, num_embeddings)) is
         # mapped to a learned embed_dim vector.
-        self.embed = nnx.Embed(num_embeddings=num_embeddings, features=embed_dim, rngs=rngs)
-        self.transformer_blocks = nnx.Sequential(
-            *[TransformerBlock(embed_dim, num_heads, rngs=rngs) for _ in range(num_transformer_blocks)]
+        self.embed = nnx.Embed(
+            num_embeddings=num_embeddings, features=embed_dim, rngs=rngs
         )
-        self.policy_head = nnx.Linear(in_features=embed_dim, out_features=action_dim, rngs=rngs)
-        self.value_head = nnx.Linear(in_features=embed_dim, out_features=1, rngs=rngs)
+        self.transformer_blocks = nnx.Sequential(
+            *[
+                TransformerBlock(embed_dim, num_heads, rngs=rngs)
+                for _ in range(num_transformer_blocks)
+            ]
+        )
+        self.policy_head = nnx.Linear(
+            in_features=embed_dim, out_features=action_dim, rngs=rngs
+        )
+        self.value_head = nnx.Linear(
+            in_features=embed_dim, out_features=1, rngs=rngs
+        )
 
     def __call__(
         self, state: Int[Array, "... state_dim"]
@@ -82,6 +99,16 @@ def _policy_forward(
 ) -> tuple[Float[Array, "batch action_dim"], Float[Array, "batch"]]:
     """JIT-compiled forward pass. ``nnx.jit`` traces the module's parameters."""
     return policy(indices)
+
+
+# @nnx.jit
+# def _policy_probs(
+#     policy: Policy, indices: Int[Array, "batch state_dim"]
+# ) -> tuple[Float[Array, "batch action_dim"], Float[Array, "batch"]]:
+#     """JIT-compiled forward pass that fuses the softmax over the action head, so
+#     the whole forward + normalization runs as a single compiled call."""
+#     logits, value = policy(indices)
+#     return jax.nn.softmax(logits, axis=-1), value
 
 
 class PolicyRubikCubeEvaluator(Evaluator):

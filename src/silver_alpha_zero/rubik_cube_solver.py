@@ -6,6 +6,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 import magiccube
+import orbax.checkpoint as ocp
 
 from cube_viz import save_trajectory_gif
 from mcst import Action, Evaluator, Model, MonteCarloTreeSearch, State
@@ -192,10 +193,39 @@ def solve_rubik_cube(initial_state: RubikCubeState, model: Model, mcts: MonteCar
     return actions
 
 
+def load_policy_checkpoint(
+    policy: Policy,
+    checkpoint_dir: str | Path,
+    step: int | None = None,
+) -> int:
+    """Restore ``policy`` weights from an Orbax checkpoint saved by ``train_policy``.
+
+    Returns the checkpoint step that was loaded. Uses the latest step when
+    ``step`` is ``None``.
+    """
+    directory = Path(checkpoint_dir).expanduser().resolve()
+    manager = ocp.CheckpointManager(
+        directory,
+        options=ocp.CheckpointManagerOptions(create=True),
+    )
+    target_step = manager.latest_step() if step is None else step
+    if target_step is None:
+        raise FileNotFoundError(f"No checkpoints found in {directory}")
+    restored = manager.restore(
+        target_step,
+        args=ocp.args.StandardRestore(nnx.state(policy)),
+    )
+    nnx.update(policy, restored)
+    return target_step
+
+
 if __name__ == "__main__":
     size = 2
+    checkpoint_dir = Path(__file__).resolve().parents[2] / "checkpoints/silver_alpha_zero"
+    checkpoint_step = None  # latest; set e.g. 60 to load a specific step
+
     cube = magiccube.Cube(size)
-    cube.scramble(4)
+    cube.scramble(5)
     initial_state = RubikCubeState(cube)
     print("scrambled:")
     print(initial_state)
@@ -203,19 +233,28 @@ if __name__ == "__main__":
     
 
     model = RubikCubeModel(size)
-    evaluator = RandomRolloutRubikCubeEvaluator(model)
-    # evaluator = HeuristicRubikCubeEvaluator(model)
+    action_dim = len(model.legal_actions(initial_state))
+    print("action_dim:", action_dim)
 
-    print("action_dim:", len(model.legal_actions(initial_state)))
-    policy = Policy(num_embeddings=len(magiccube.Color), state_dim=len(cube.get()), action_dim=len(model.legal_actions(initial_state)), embed_dim=128, num_transformer_blocks=2, num_heads=2, rngs=nnx.Rngs(0))
+    policy = Policy(
+        num_embeddings=len(magiccube.Color),
+        state_dim=len(cube.get()),
+        action_dim=action_dim,
+        embed_dim=128,
+        num_transformer_blocks=8,
+        num_heads=2,
+        rngs=nnx.Rngs(0),
+    )
+    loaded_step = load_policy_checkpoint(policy, checkpoint_dir, step=checkpoint_step)
+    print(f"loaded checkpoint step {loaded_step} from {checkpoint_dir}")
 
-    # evaluator = PolicyRubikCubeEvaluator(model, policy)
+    evaluator = PolicyRubikCubeEvaluator(model, policy)
     mcts = MonteCarloTreeSearch(model, evaluator, c_puct=5)
 
     max_trajectory = 500
     num_simulation_rollouts = 200
     actions = solve_rubik_cube(initial_state, model, mcts, max_trajectory, num_simulation_rollouts)
-    
+
     print("trajectory:", " ".join(str(a) for a in actions) or "(empty)")
     # here = Path(__file__).parent
     # print(f"saved {save_trajectory_gif(initial_state.cube, actions, here / 'cube_solution.gif', mode='2d')}")

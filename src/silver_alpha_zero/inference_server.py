@@ -35,7 +35,7 @@ def run_inference_server(
     weight_queue: "MpQueue",
     stop_event: "MpEvent",
     ready_event: "MpEvent",
-    max_batch: int = 64,
+    max_batch: int,
     poll_timeout: float = 0.005,
 ) -> None:
     """Serve batched policy evaluations until ``stop_event`` is set.

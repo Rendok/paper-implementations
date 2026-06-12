@@ -72,11 +72,12 @@ class Node:
 
 class MonteCarloTreeSearch:
     """Monte Carlo Tree Search algorithm."""
-    def __init__(self, model: Model, evaluator: Evaluator, c_puct: float = 1.4, discount: float = 0.99):
+    def __init__(self, model: Model, evaluator: Evaluator, c_puct: float = 1.4, discount: float = 0.99, loop_penalty: float = -1.0):
         self.model = model
         self.evaluator = evaluator
         self.c_puct = c_puct
         self.discount = discount
+        self.loop_penalty = loop_penalty
 
     def search(
         self, root_state: State, num_iterations: int, tau: float = 1.0
@@ -87,9 +88,12 @@ class MonteCarloTreeSearch:
         self._nodes: dict[State, Node] = {}
         root = self._node(root_state)
         for _ in range(num_iterations):
-            path = self._select(root)
+            path, looped = self._select(root)
             leaf = path[-1]
-            value = self._expand_and_evaluate(leaf)
+            # Selection that runs back into a state already on the path is a
+            # non-productive cycle; penalize it instead of bootstrapping from the
+            # revisited node's current estimate.
+            value = self.loop_penalty if looped else self._expand_and_evaluate(leaf)
             self._backup(path, value)
         return self._best_action(root), self._action_distribution(root, tau)
 
@@ -101,18 +105,21 @@ class MonteCarloTreeSearch:
             self._nodes[state] = node
         return node
 
-    def _select(self, root: Node) -> list[Node]:
+    def _select(self, root: Node) -> tuple[list[Node], bool]:
         """Walk down via PUCT to a leaf, stopping if a transposition revisits a
-        state already on the path (the DAG can contain cycles)."""
+        state already on the path (the DAG can contain cycles).
+
+        Returns the trajectory and whether selection stopped on a cycle.
+        """
         trajectory = [root]
         visited = {root.state}
         while trajectory[-1].is_expanded() and not trajectory[-1].state.is_terminal():
             child = self._select_step(trajectory[-1])
             if child.state in visited:  # cycle back to an ancestor; stop here
-                break
+                return trajectory, True
             trajectory.append(child)
             visited.add(child.state)
-        return trajectory
+        return trajectory, False
 
     def _select_step(self, node: Node) -> Node:
         c = self.c_puct
@@ -128,11 +135,7 @@ class MonteCarloTreeSearch:
         # value that backup bootstraps from and propagates up the path.
         if leaf.state.is_terminal():
             return leaf.state.reward()
-        # The leaf can already be expanded if selection stopped on a cycle; in
-        # that case bootstrap from its current estimate instead of re-expanding.
-        if leaf.is_expanded():
-            return leaf.q
-        
+
         priors, value = self.evaluator.evaluate(leaf.state)
         leaf.priors = dict(priors)
         leaf.children = {

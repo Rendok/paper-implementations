@@ -86,7 +86,7 @@ def _self_play_episode(model, mcts, sp_config: dict, rng: np.random.Generator):
     for _ in range(sp_config["max_trajectory"]):
         if state.is_terminal():
             break
-        _, action_distribution = mcts.search(
+        best_action, action_distribution = mcts.search(
             state, sp_config["num_simulation_rollouts"], sp_config["tau"]
         )
         policy_vec = np.zeros(len(legal_actions), dtype=np.float32)
@@ -95,8 +95,8 @@ def _self_play_episode(model, mcts, sp_config: dict, rng: np.random.Generator):
         state_strings.append(state.get())
         policies.append(policy_vec)
 
-        action = legal_actions[rng.choice(len(legal_actions), p=policy_vec)]
-        state = model.step(state, action)
+        # action = legal_actions[rng.choice(len(legal_actions), p=policy_vec)]
+        state = model.step(state, best_action)
         rewards.append(state.reward())
 
     if not state_strings:
@@ -113,16 +113,50 @@ def _self_play_episode(model, mcts, sp_config: dict, rng: np.random.Generator):
     return states, np.asarray(policies, dtype=np.float32), values
 
 
+def _greedy_eval_episode(model, mcts, sp_config: dict, seed: int) -> tuple[int, bool]:
+    """Play one greedy (``tau=0``) episode with a fixed scramble seed.
+
+    Returns ``(trajectory_length, solved)``. Unsolved runs report
+    ``max_trajectory`` as the length.
+    """
+    import random
+
+    from rubik_cube_solver import RubikCubeState
+
+    random.seed(seed)
+    cube = magiccube.Cube(sp_config["cube_size"])
+    cube.scramble(sp_config["scramble_depth"])
+    state = RubikCubeState(cube)
+    if state.is_terminal():
+        return 0, True
+
+    max_trajectory = sp_config["max_trajectory"]
+    steps = 0
+    for _ in range(max_trajectory):
+        if state.is_terminal():
+            break
+        action, _ = mcts.search(state, sp_config["num_simulation_rollouts"], tau=0.0)
+        state = model.step(state, action)
+        steps += 1
+
+    solved = state.is_terminal() and state.reward() > 0
+    return (steps if solved else max_trajectory), solved
+
+
 def run_worker(
     worker_id: int,
     request_queue,
     response_queue,
     result_queue,
+    command_queue,
+    eval_result_queue,
     stop_event,
     sp_config: dict,
+    num_workers: int,
 ) -> None:
-    """Continuously generate self-play episodes until ``stop_event`` is set."""
+    """Generate self-play episodes, or run greedy eval when commanded."""
     import os
+    import queue as pyqueue
 
     # Keep the GPU reserved for the server/trainer; this process is CPU-only.
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
@@ -139,6 +173,26 @@ def run_worker(
     rng = np.random.default_rng(sp_config.get("seed_base", 0) + worker_id)
 
     while not stop_event.is_set():
+        try:
+            cmd = command_queue.get_nowait()
+        except pyqueue.Empty:
+            cmd = None
+
+        if cmd is not None:
+            kind = cmd[0]
+            if kind == "eval":
+                _, sync_id, eval_seed_base, eval_trials = cmd
+                for trial in range(worker_id, eval_trials, num_workers):
+                    length, solved = _greedy_eval_episode(
+                        model, mcts, sp_config, eval_seed_base + trial
+                    )
+                    eval_result_queue.put((sync_id, length, solved))
+            elif kind == "set_scramble_depth":
+                sp_config["scramble_depth"] = cmd[1]
+                if len(cmd) > 2:
+                    sp_config["max_trajectory"] = cmd[2]
+            continue
+
         trajectory = _self_play_episode(model, mcts, sp_config, rng)
         if trajectory is not None:
             result_queue.put(trajectory)
