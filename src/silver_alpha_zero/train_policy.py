@@ -91,7 +91,7 @@ class AsyncEval:
 
 
 def _max_trajectory_for_depth(depth: int) -> int:
-    return depth * 5
+    return depth * 3
 
 
 def _max_trajectory_schedule(scramble_depth_schedule: dict[int, int]) -> dict[int, int]:
@@ -379,9 +379,9 @@ if __name__ == "__main__":
         "scramble_depth": 4,
         "scramble_depth_schedule": {
             # 150: 4,
-            1000: 8,
+            750: 8,
         },
-        "max_trajectory": _max_trajectory_for_depth(2),
+        "max_trajectory": _max_trajectory_for_depth(4),
         "num_simulation_rollouts": 1000,
         "tau": 1.0,
         "c_puct": 1.5,

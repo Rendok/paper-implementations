@@ -240,22 +240,22 @@ if __name__ == "__main__":
         num_embeddings=len(magiccube.Color),
         state_dim=len(cube.get()),
         action_dim=action_dim,
-        embed_dim=128,
-        num_transformer_blocks=8,
-        num_heads=2,
+        embed_dim=256,
+        num_transformer_blocks=16,
+        num_heads=4,
         rngs=nnx.Rngs(0),
     )
     loaded_step = load_policy_checkpoint(policy, checkpoint_dir, step=checkpoint_step)
     print(f"loaded checkpoint step {loaded_step} from {checkpoint_dir}")
 
     evaluator = PolicyRubikCubeEvaluator(model, policy)
-    mcts = MonteCarloTreeSearch(model, evaluator, c_puct=5)
+    mcts = MonteCarloTreeSearch(model, evaluator, c_puct=1.5)
 
     max_trajectory = 500
     num_simulation_rollouts = 200
     actions = solve_rubik_cube(initial_state, model, mcts, max_trajectory, num_simulation_rollouts)
 
     print("trajectory:", " ".join(str(a) for a in actions) or "(empty)")
-    # here = Path(__file__).parent
-    # print(f"saved {save_trajectory_gif(initial_state.cube, actions, here / 'cube_solution.gif', mode='2d')}")
-    # print(f"saved {save_trajectory_gif(initial_state.cube, actions, here / 'cube_solution_3d.gif', mode='3d')}")
+    here = Path(__file__).parent
+    print(f"saved {save_trajectory_gif(initial_state.cube, actions, here / 'cube_solution.gif', mode='2d')}")
+    print(f"saved {save_trajectory_gif(initial_state.cube, actions, here / 'cube_solution_3d.gif', mode='3d')}")

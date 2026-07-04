@@ -27,6 +27,8 @@ from rubik_cube_solver import (
 
 
 def average_solution_length(
+    model: RubikCubeModel,
+    mcts: MonteCarloTreeSearch,
     size: int,
     scramble_depth: int,
     num_simulations: int,
@@ -47,10 +49,10 @@ def average_solution_length(
         cube = magiccube.Cube(size)
         cube.scramble(scramble_depth)
 
-        model = RubikCubeModel(size)
+        # model = RubikCubeModel(size)
         # evaluator = RandomRolloutRubikCubeEvaluator(model, rng=random.Random(seed))
-        evaluator = HeuristicRubikCubeEvaluator(model)
-        mcts = MonteCarloTreeSearch(model, evaluator)
+        # evaluator = HeuristicRubikCubeEvaluator(model)
+        # mcts = MonteCarloTreeSearch(model, evaluator)
 
         actions = solve_rubik_cube(
             RubikCubeState(cube),
@@ -71,12 +73,15 @@ def run_experiment(
     base_seed: int,
     max_trajectory: int,
 ) -> dict[int, list[float]]:
+    model = RubikCubeModel(size)
+    evaluator = RandomRolloutRubikCubeEvaluator(model, rng=random.Random(0)) # seed
+    mcts = MonteCarloTreeSearch(model, evaluator)
     results: dict[int, list[float]] = {}
     for depth in scramble_depths:
         row: list[float] = []
         for num_simulations in simulation_counts:
             avg = average_solution_length(
-                size, depth, num_simulations, trials, base_seed, max_trajectory
+                model, mcts, size, depth, num_simulations, trials, base_seed, max_trajectory
             )
             row.append(avg)
             print(f"depth={depth} sims={num_simulations:>4} -> avg_len={avg:.2f}")

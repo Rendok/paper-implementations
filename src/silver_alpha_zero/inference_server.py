@@ -111,9 +111,13 @@ def run_inference_server(
 
         states = jnp.asarray(states_np, dtype=jnp.int32)
         probs, values = forward(graphdef, state, states)
-        # Drop the padded rows before responding.
-        probs = np.asarray(probs[:n])
-        values = np.asarray(values[:n])
+        # Drop the padded rows before responding. Transfer to host *first*, then
+        # slice in NumPy: slicing the device arrays with the data-dependent count
+        # ``n`` triggers a fresh ``dynamic_slice`` XLA compile for every distinct
+        # batch size (1..max_batch), which trickles compilation cost throughout
+        # serving and stalls the workers waiting on responses.
+        probs = np.asarray(probs)[:n]
+        values = np.asarray(values)[:n]
 
         for (worker_id, request_id, _), prob_row, value in zip(batch, probs, values):
             response_queues[worker_id].put((request_id, prob_row, float(value)))

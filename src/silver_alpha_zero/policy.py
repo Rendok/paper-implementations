@@ -1,3 +1,4 @@
+import functools
 from collections.abc import Sequence
 
 import jax
@@ -12,6 +13,9 @@ from mcst import Action, Evaluator, Model, State
 # indices match the rest of the codebase.
 _COLOR_TO_INDEX = {color.name: color.value for color in magiccube.Color}
 
+# Base wavelength for rotary positional embeddings (RoPE), as in the original paper.
+_ROPE_BASE = 10_000.0
+
 
 def states_to_indices(states: Sequence[str]) -> Int[Array, "batch state_dim"]:
     """Convert a batch of cube facelet strings to an integer index array.
@@ -23,15 +27,54 @@ def states_to_indices(states: Sequence[str]) -> Int[Array, "batch state_dim"]:
     return jnp.asarray(indices, dtype=jnp.int32)
 
 
+def _rotate_half(x: Float[Array, "... d"]) -> Float[Array, "... d"]:
+    """Rotate the last dimension by splitting it in half: (x1, x2) -> (-x2, x1)."""
+    x1, x2 = jnp.split(x, 2, axis=-1)
+    return jnp.concatenate([-x2, x1], axis=-1)
+
+
+def _apply_rope(
+    x: Float[Array, "... length heads head_dim"], base: float
+) -> Float[Array, "... length heads head_dim"]:
+    """Apply rotary positional embedding along the sequence (length) axis.
+
+    ``x`` is the per-head query/key tensor of shape ``(..., length, heads,
+    head_dim)`` as produced inside :class:`nnx.MultiHeadAttention`. RoPE encodes
+    absolute position as a rotation in each 2D feature plane, so attention scores
+    depend only on relative position.
+    """
+    seq_len = x.shape[-3]
+    head_dim = x.shape[-1]
+    half = head_dim // 2
+    # Per-pair inverse frequencies; positions index the sequence axis.
+    inv_freq = 1.0 / (base ** (jnp.arange(half, dtype=jnp.float32) / half))
+    pos = jnp.arange(seq_len, dtype=jnp.float32)
+    freqs = jnp.outer(pos, inv_freq)            # (length, head_dim/2)
+    emb = jnp.concatenate([freqs, freqs], axis=-1)  # (length, head_dim)
+    cos = jnp.cos(emb)[:, None, :].astype(x.dtype)  # (length, 1, head_dim)
+    sin = jnp.sin(emb)[:, None, :].astype(x.dtype)
+    return x * cos + _rotate_half(x) * sin
+
+
+def _rope_dot_product_attention(query, key, value, *, base: float = _ROPE_BASE, **kwargs):
+    """``nnx.dot_product_attention`` with RoPE applied to the query and key."""
+    query = _apply_rope(query, base)
+    key = _apply_rope(key, base)
+    return nnx.dot_product_attention(query, key, value, **kwargs)
+
+
 class TransformerBlock(nnx.Module):
-    def __init__(self, embed_dim: int, num_heads: int, *, rngs: nnx.Rngs):
+    def __init__(self, embed_dim: int, num_heads: int, *, rngs: nnx.Rngs, rope_base: float = _ROPE_BASE):
         self.embed_dim = embed_dim
         self.num_heads = num_heads
+        # RoPE rotates feature pairs, so the per-head dimension must be even.
+        assert (embed_dim // num_heads) % 2 == 0, "head_dim must be even for RoPE"
         self.attention = nnx.MultiHeadAttention(
             in_features=embed_dim,
             num_heads=num_heads,
             decode=False,
             use_bias=False,
+            attention_fn=functools.partial(_rope_dot_product_attention, base=rope_base),
             rngs=rngs,
         )
         self.linear1 = nnx.Linear(
@@ -99,16 +142,6 @@ def _policy_forward(
 ) -> tuple[Float[Array, "batch action_dim"], Float[Array, "batch"]]:
     """JIT-compiled forward pass. ``nnx.jit`` traces the module's parameters."""
     return policy(indices)
-
-
-# @nnx.jit
-# def _policy_probs(
-#     policy: Policy, indices: Int[Array, "batch state_dim"]
-# ) -> tuple[Float[Array, "batch action_dim"], Float[Array, "batch"]]:
-#     """JIT-compiled forward pass that fuses the softmax over the action head, so
-#     the whole forward + normalization runs as a single compiled call."""
-#     logits, value = policy(indices)
-#     return jax.nn.softmax(logits, axis=-1), value
 
 
 class PolicyRubikCubeEvaluator(Evaluator):
