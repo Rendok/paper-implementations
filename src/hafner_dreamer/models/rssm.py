@@ -126,7 +126,8 @@ class RSSM(nnx.Module):
         initial_carry: Optional[Carry] = None,
         return_carry: bool = True,
     ):
-        return self.teacher_forcing_forward(images, actions, initial_carry, return_carry)
+        raise NotImplementedError("This method is not implemented yet.")
+        # return self.teacher_forcing_forward(images, actions, initial_carry, return_carry)
 
     def teacher_forcing_forward(
         self,
@@ -142,7 +143,7 @@ class RSSM(nnx.Module):
         # compute h_{t+1} and prior p(z_{t+1} | h_{t+1}) for t = 0 … T-2.
         # The LSTM sees real observations (via z) at every step, not its own
         # predictions — this keeps h well-conditioned throughout training.
-        carry, (deter, prior_stoch, prior_pi_logits, prior_mu, prior_log_var) = self.latent_forward(
+        carry, (deter, prior_stoch, prior_pi_logits, prior_mu, prior_log_var) = self.teacher_forcing_latent_forward(
             post_stoch[:, :-1], actions[:, :-1],
             initial_carry=initial_carry, return_carry=return_carry,
         )
@@ -233,6 +234,100 @@ class RSSM(nnx.Module):
 
         carry = lstm_carry if return_carry else None
         return carry, (deter, prior_stoch_seq, prior_pi_logits, prior_mu_components, prior_log_var_comps)
+
+    def autoregressive_forward(
+        self,
+        first_frame: Float[Array, "batch height width channels"],
+        actions: Float[Array, "batch seq action_dim"],
+        initial_carry: Optional[Carry] = None,
+        return_carry: bool = True,
+    ):
+        """Pure imagination: encode one real frame → z_0, then roll forward with
+        the prior for T steps using the provided actions.
+
+        Returns T imagined frames plus latent trajectory.  No KL computation.
+        """
+        # Encode the single seed frame → z_0  (batch, stoch_dim).
+        z_0, _, _, _ = self.encoder(first_frame)
+
+        # Roll the prior forward for T steps.
+        carry, (deter, stoch, pi_logits, mu, log_var) = self.autoregressive_latent_forward(
+            z_0, actions,
+            initial_carry=initial_carry,
+            return_carry=return_carry,
+        )
+
+        # Decode imagined stoch → pixel frames.
+        imagined_frames = self.decoder(stoch)   # (B, T, H, W, C)
+
+        # Reward / continue predictions from imagined features.
+        features = jnp.concatenate([deter, stoch], axis=-1)   # (B, T, mem+D)
+        reward_logit, continue_logit = self.reward_continue(features)
+
+        outputs = {
+            "deter":           deter,           # (B, T, memory_dim)
+            "stoch":           stoch,           # (B, T, stoch_dim)
+            "pi_logits":       pi_logits,       # (B, T, K)
+            "mu":              mu,              # (B, T, K, D)
+            "log_var":         log_var,         # (B, T, K, D)
+            "imagined_frames": imagined_frames, # (B, T, H, W, C)
+            "features":        features,
+            "reward_logit":    reward_logit,    # (B, T, 1)
+            "continue_logit":  continue_logit,  # (B, T, 1)
+        }
+        if return_carry:
+            return carry, outputs
+        return outputs
+
+    def autoregressive_latent_forward(
+        self,
+        z_0: Float[Array, "batch stoch_dim"],
+        actions: Float[Array, "batch seq action_dim"],
+        initial_carry: Optional[Carry] = None,
+        return_carry: bool = True,
+    ):
+        """Imagination rollout seeded from z_0: prior z feeds back as the next input.
+
+        At step t (t = 0 … T-1):
+            h_{t+1}       = LSTM( h_t, concat(z_t, a_t) )
+            z_{t+1}, ...  = DynamicPredictor(h_{t+1})   # sample from prior
+
+        The prior sample z_{t+1} becomes the RNN input at step t+1 — no real
+        observations are used after the seed z_0.
+
+        Returns T imagined steps: deter, stoch, pi_logits, mu, log_var,
+        each of shape (batch, seq, ...).
+        """
+        batch = actions.shape[0]
+        if initial_carry is None:
+            initial_carry = self.initialize_carry(batch, rngs=self.rngs)
+
+        def rnn_step(carry, x_t):
+            action_t, rng_key_t = x_t
+            lstm_carry, prev_z = carry
+            rnn_input = jnp.concatenate([prev_z, action_t], axis=-1)
+            lstm_carry, deter_t = self.cell(lstm_carry, rnn_input)
+            z_t, pi_t, mu_t, log_var_t = self.prior(deter_t, rng_key=rng_key_t)
+            return (lstm_carry, z_t), (deter_t, z_t, pi_t, mu_t, log_var_t)
+
+        seq = actions.shape[1]
+        step_keys = jax.random.split(self.rngs.noise(), seq)
+
+        actions_T = jnp.swapaxes(actions, 0, 1)  # (seq, batch, action_dim)
+
+        (lstm_carry, _), (deter_T, stoch_T, pi_T, mu_T, log_var_T) = jax.lax.scan(
+            rnn_step, (initial_carry, z_0), (actions_T, step_keys)
+        )
+
+        # Swap back to (batch, seq, ...).
+        deter    = jnp.swapaxes(deter_T,   0, 1)
+        stoch    = jnp.swapaxes(stoch_T,   0, 1)
+        pi_logits = jnp.swapaxes(pi_T,     0, 1)
+        mu       = jnp.swapaxes(mu_T,      0, 1)
+        log_var  = jnp.swapaxes(log_var_T, 0, 1)
+
+        carry = lstm_carry if return_carry else None
+        return carry, (deter, stoch, pi_logits, mu, log_var)
 
     @staticmethod
     def log_prob(

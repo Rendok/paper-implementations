@@ -19,11 +19,21 @@ Loss terms
 
 from __future__ import annotations
 
+import os
+
+# The trainer and the inference-server/self-play processes are separate JAX
+# processes sharing one GPU, so none may greedily preallocate the whole
+# device. Must be set before jax is imported anywhere in this process.
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
+import multiprocessing as mp
 import sys
 from pathlib import Path
 
-# Expose the models package (local imports: encoder_decoder, rssm, …)
+# Expose the models package (local imports: encoder_decoder, rssm, …) and the
+# shared inference-server module (sibling package under src/).
 sys.path.insert(0, str(Path(__file__).parent / "models"))
+sys.path.insert(0, str(Path(__file__).parent.parent / "multithreading"))
 
 import jax
 import jax.numpy as jnp
@@ -32,76 +42,15 @@ import mlflow
 import numpy as np
 import optax
 import orbax.checkpoint as ocp
+from jaxtyping import Float
 from flax import nnx
-from PIL import Image
 from tqdm import tqdm
-
-import gymnasium as gym
 
 from replay_buffer import SequenceReplayBuffer
 from rssm import RSSM
-
-
-# ---------------------------------------------------------------------------
-# Environment helpers
-# ---------------------------------------------------------------------------
-
-IMAGE_SIZE = (64, 64)  # MDNEncoder architecture is fixed to 64×64 input
-
-
-def preprocess_frame(frame: np.ndarray) -> np.ndarray:
-    """Resize a (H, W, 3) uint8 frame to IMAGE_SIZE uint8."""
-    img = Image.fromarray(frame).resize(IMAGE_SIZE, Image.BILINEAR)
-    return np.asarray(img, dtype=np.uint8)
-
-
-def collect_episode(
-    env: gym.Env,
-    *,
-    action_repeat: int = 2,
-    max_steps: int = 1000,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Collect one episode with a random policy.
-
-    Each timestep: sample a random action, repeat it *action_repeat* times,
-    sum the rewards, record the final observation.
-
-    Returns
-    -------
-    images   : uint8  (T, 64, 64, 3)
-    actions  : float32 (T, action_dim)
-    rewards  : float32 (T,)
-    continues: float32 (T,)   1 = episode not done, 0 = done
-    """
-    obs, _ = env.reset()
-    images, actions, rewards, continues = [], [], [], []
-
-    done = False
-    step = 0
-    while not done and step < max_steps:
-        action = env.action_space.sample()
-        total_reward = 0.0
-        last_obs = obs
-        for _ in range(action_repeat):
-            last_obs, r, terminated, truncated, _ = env.step(action)
-            total_reward += r
-            done = terminated or truncated
-            if done:
-                break
-
-        images.append(preprocess_frame(last_obs))
-        actions.append(np.asarray(action, dtype=np.float32))
-        rewards.append(float(total_reward))
-        continues.append(0.0 if done else 1.0)
-        obs = last_obs
-        step += 1
-
-    return (
-        np.stack(images),
-        np.stack(actions),
-        np.array(rewards, dtype=np.float32),
-        np.array(continues, dtype=np.float32),
-    )
+from controller import ActionValue, Critic, EncoderPolicy, Policy, Temperature, build_encoder_policy
+from inference_server import extract_weights, run_inference_server
+from self_play_worker import run_worker
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +73,7 @@ def rssm_loss(
     continue_weight: jax.Array,
     free_bits: jax.Array,       # scalar nats; KL below this per-step is ignored
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
-    _, out = rssm(images, actions, initial_carry=None, return_carry=True)
+    _, out = rssm.teacher_forcing_forward(images, actions, initial_carry=None, return_carry=True)
 
     # Reconstruction: compare decoder output (all T frames) against all images.
     recon_loss = jnp.mean((out["reconstruction"] - images) ** 2)
@@ -132,14 +81,7 @@ def rssm_loss(
     z_sg = jax.lax.stop_gradient(out["post_stoch"])  # (B, T-1, D)
     log_post_dist  = RSSM.log_prob(z_sg, out["post_pi_logits"],  out["post_mu"],  out["post_log_var"])
     log_prior_dist = RSSM.log_prob(z_sg, out["prior_pi_logits"], out["prior_mu"], out["prior_log_var"])
-    kl_per_step = jax.lax.stop_gradient(log_post_dist) - log_prior_dist  # (B, T-1)
-    # KL: post_stoch / post_* are already aligned to z_1..z_{T-1};
-    # prior_* covers the same range — no off-by-one here.
-    #
-    # DreamerV2-style 80/20 KL balancing:
-    #   80% — trains only the prior  (stop_gradient on z and on log_q)
-    #   20% — trains only the encoder (stop_gradient on log_p, gradient flows
-    #          through z via reparameterisation back to the encoder)
+    kl_per_step = jax.lax.stop_gradient(log_post_dist) - log_prior_dist  
     # The 20% term regularises the encoder to stay in a space the prior can
     # reach, providing a gradient signal that pure reconstruction alone lacks.
     # z      = out["post_stoch"]                     # (B, T-1, D) reparameterised
@@ -173,9 +115,264 @@ def rssm_loss(
         "log_prior_dist":    jnp.mean(log_prior_dist),
     }
 
+def policy_loss(
+    rssm: RSSM,
+    policy: Policy,
+    # Starting latent states sampled from a teacher-forcing rollout.
+    # Shape (B, features_dim) = concat([deter, post_stoch]) at some real step.
+    start_features: jax.Array,
+    horizon: jax.Array,    # imagination horizon (number of steps)
+    gamma: jax.Array,      # discount factor
+) -> tuple[jax.Array, dict[str, jax.Array]]:
+    """REINFORCE loss computed entirely in imagination (latent space).
+
+    Algorithm
+    ---------
+    For each starting (h, z) in the batch:
+      1. For t = 0 … H-1:
+           a_t   ~ π(· | h_t, z_t)              # sample policy
+           h_{t+1}, z_{t+1} = RSSM.prior_step(h_t, z_t, a_t)
+           r_t, c_t = reward_head(h_t, z_t)     # imagined reward & continue
+      2. Compute discounted returns:
+           R_t = Σ_{k=t}^{H-1}  γ^{k-t} · r_k · Π_{j=t}^{k-1} c_j
+      3. Baseline: subtract mean return to reduce variance.
+      4. Loss: -mean_t [ R_t · log π(a_t | h_t, z_t) ]
+    """
+    B = start_features.shape[0]
+    mem_d = rssm.memory_dim
+    # Split starting features back into (h, z).
+    h0 = start_features[:, :mem_d]          # (B, memory_dim)
+    z0 = start_features[:, mem_d:]          # (B, stoch_dim)
+
+    # Initialise LSTM carry from h0: both cell and hidden start at h0.
+    initial_carry = (h0, h0)
+
+    def scan_step(carry, rng_t):
+        lstm_carry, prev_z = carry
+
+        # Stop gradient through the world-model state so RSSM parameters are
+        # not updated during the policy step — the world model is a frozen
+        # simulator here; only policy weights should receive gradient.
+        features_t = jax.lax.stop_gradient(
+            jnp.concatenate([lstm_carry[0], prev_z], axis=-1)
+        )
+
+        # Split key: half for policy sample, half for prior sample.
+        rng_pol, rng_prior = jax.random.split(rng_t)
+        action_t, log_pi_t = policy.sample(features_t, rng_key=rng_pol)
+        _, std_t = policy._mu_and_std(features_t)  # for diagnostics only
+
+        # Step the deterministic RNN.
+        rnn_input = jnp.concatenate([prev_z, action_t], axis=-1)
+        lstm_carry, deter_t = rssm.cell(lstm_carry, rnn_input)
+
+        # Sample next z from prior.
+        z_t, _, _, _ = rssm.prior(deter_t, rng_key=rng_prior)
+
+        # Imagined reward and continue (from current features_t).
+        reward_t, continue_logit_t = rssm.reward_continue(features_t)
+        r_t = reward_t[..., 0]                          # (B,)
+        c_t = jax.nn.sigmoid(continue_logit_t[..., 0])  # (B,) ∈ (0, 1)
+
+        new_carry = (lstm_carry, z_t)
+        return new_carry, (r_t, c_t, log_pi_t, std_t)
+
+    step_rngs = jax.random.split(rssm.rngs.noise(), horizon)
+    _, (rewards_h, continues_h, log_pis_h, stds_h) = jax.lax.scan(
+        scan_step, (initial_carry, z0), step_rngs
+    )
+    # rewards_h, continues_h, log_pis_h: (H, B)
+
+    # --- discounted returns ---
+    # R_t = r_t + γ·c_t·r_{t+1} + γ²·c_t·c_{t+1}·r_{t+2} + …
+    # Computed backwards in a scan.
+    def return_step(future_return, rc_t):
+        r_t, c_t = rc_t
+        G_t = r_t + gamma * c_t * future_return
+        return G_t, G_t
+
+    _, returns_h = jax.lax.scan(
+        return_step,
+        jnp.zeros(B),
+        (rewards_h, continues_h),
+        reverse=True,
+    )
+    # returns_h: (H, B)
+
+    # Treat returns as a constant weight — REINFORCE does not differentiate
+    # through R_t (it is the "environment signal", not a network output).
+    returns_h = jax.lax.stop_gradient(returns_h.T)
+
+    # Normalise returns (baseline = mean over time × batch).
+    returns_h = (returns_h - returns_h.mean()) #/ (returns_h.std() + 1e-8)
+
+    # REINFORCE: maximise E[R · log π]  →  minimise -E[R · log π].
+    loss = -jnp.mean(returns_h * log_pis_h)
+
+    return loss, {
+        "policy_loss":      loss,
+        "imagined_return":  jnp.mean(returns_h * (returns_h.std() + 1e-8) + returns_h.mean()),
+        "mean_reward":      jnp.mean(rewards_h),
+        "mean_log_pi":      jnp.mean(log_pis_h),
+        "policy_std":       jnp.mean(stds_h),
+    }
+
+
+def q_loss_real(
+    critic: Critic,
+    critic_target: Critic,
+    policy: Policy,
+    temperature: Temperature,
+    features: Float[jax.Array, "batch seq stoch_dim"],   # RSSM encoder output (frozen)
+    actions: Float[jax.Array, "batch seq action_dim"],    # raw actions from replay buffer
+    rewards: Float[jax.Array, "batch seq"],
+    continues: Float[jax.Array, "batch seq"],
+    gamma: Float[jax.Array, ()],
+    rng_key: jax.Array,
+) -> tuple[jax.Array, dict[str, jax.Array]]:
+    """SAC critic (soft Bellman residual) loss on one-step real transitions.
+
+    ``collect_episode`` stores frame ``t``, the raw action sampled at ``t``,
+    the reward earned and whether the *next* frame is terminal — so
+    ``(features[t], actions[t], rewards[t], continues[t], features[t+1])``
+    is exactly a one-step transition; no imagined rollout is involved.
+
+    Target: y = r + γ·c·(min(Q1', Q2')(s', a') − α·log π(a'|s'))
+    with a' ~ π(·|s') (current policy, target *critics*).
+    """
+    s      = features[:, :-1]
+    s_next = features[:, 1:]
+    a      = actions[:, :-1]          # already squashed/bounded (from the buffer)
+    r      = rewards[:, :-1]
+    c      = continues[:, :-1]
+
+    # policy.sample already returns a bounded (tanh-squashed) action.
+    next_action, next_log_pi = policy.sample(s_next, rng_key=rng_key)
+
+    q1_next, q2_next = critic_target(s_next, next_action)
+    q_next = jnp.minimum(q1_next, q2_next) - temperature.value * next_log_pi
+    target = jax.lax.stop_gradient(r + gamma * c * q_next)
+
+    q1_pred, q2_pred = critic(s, a)
+    loss = jnp.mean((q1_pred - target) ** 2) + jnp.mean((q2_pred - target) ** 2)
+
+    return loss, {
+        "q_loss":      loss,
+        "q1_mean":     jnp.mean(q1_pred),
+        "q2_mean":     jnp.mean(q2_pred),
+        "target_mean": jnp.mean(target),
+        "reward_mean": jnp.mean(r),
+    }
+
+
+def policy_loss_real(
+    policy: Policy,
+    critic: Critic,
+    temperature: Temperature,
+    features: Float[jax.Array, "batch stoch_dim"],
+    rng_key: jax.Array,
+) -> tuple[jax.Array, dict[str, jax.Array]]:
+    """SAC actor loss trained directly on real (buffer) states — off-policy.
+
+    Actions are sampled with the reparameterisation trick so gradients flow
+    a ~ π(s) → Q(s, a) → policy params. ``critic`` is only ever passed as a
+    non-differentiated argument (see ``argnums`` in ``train_step_sac_real``),
+    so its own parameters never receive gradient here — only the policy does.
+    """
+    # policy.sample already returns a bounded (tanh-squashed) action.
+    action, log_pi = policy.sample(features, rng_key=rng_key)
+    q1, q2 = critic(features, action)
+    q_min = jax.lax.stop_gradient(jnp.minimum(q1, q2))
+
+    alpha = temperature.value
+    loss = jnp.mean(alpha * log_pi - q_min)
+
+    _, std = policy._mu_and_std(features)  # for diagnostics only
+    return loss, {
+        "policy_loss": loss,
+        "mean_log_pi": jnp.mean(log_pi),
+        "mean_q":      jnp.mean(q_min),
+        "policy_std":  jnp.mean(std),
+        "alpha":       alpha,
+        "log_pi":      log_pi,  # consumed by temperature_loss_real, stripped before logging
+    }
+
+
+def temperature_loss_real(
+    temperature: Temperature,
+    log_pi: jax.Array,
+    target_entropy: Float[jax.Array, ()],
+) -> tuple[jax.Array, dict[str, jax.Array]]:
+    """Automatic entropy-coefficient tuning (Haarnoja et al., 2018).
+
+    ``log_pi`` comes from the actor step and is treated as a constant here —
+    log_alpha is pushed up when entropy is below target, down when above.
+    """
+    loss = -jnp.mean(temperature.log_alpha[...] * jax.lax.stop_gradient(log_pi + target_entropy))
+    return loss, {"temperature_loss": loss, "alpha": temperature.value}
+
+
+def soft_update(target: nnx.Module, source: nnx.Module, tau: jax.Array) -> None:
+    """Polyak-average ``target``'s params towards ``source``: target ← (1-τ)·target + τ·source."""
+    target_state = nnx.state(target, nnx.Param)
+    source_state = nnx.state(source, nnx.Param)
+    new_state = jax.tree.map(lambda t, s: (1.0 - tau) * t + tau * s, target_state, source_state)
+    nnx.update(target, new_state)
+
 
 @nnx.jit
-def train_step(
+def train_step_sac_real(
+    rssm: RSSM,
+    policy: Policy,
+    critic: Critic,
+    critic_target: Critic,
+    temperature: Temperature,
+    policy_optimizer: nnx.Optimizer,
+    critic_optimizer: nnx.Optimizer,
+    temp_optimizer: nnx.Optimizer,
+    images: jax.Array,
+    actions: jax.Array,
+    rewards: jax.Array,
+    continues: jax.Array,
+    gamma: jax.Array,
+    tau: jax.Array,
+    target_entropy: jax.Array,
+    rng_key: jax.Array,
+) -> dict[str, jax.Array]:
+    """One off-policy SAC update (critic → actor → temperature → target sync)."""
+    z, _, _, _ = rssm.encoder(images)  # (B, T, stoch_dim)
+    z = jax.lax.stop_gradient(z)       # world model is a frozen feature extractor here
+
+    rng_critic, rng_actor = jax.random.split(rng_key)
+
+    # --- critic (twin Q) update ------------------------------------------
+    q_grad_fn = nnx.value_and_grad(q_loss_real, argnums=0, has_aux=True)
+    (_, q_metrics), q_grads = q_grad_fn(
+        critic, critic_target, policy, temperature,
+        z, actions, rewards, continues, gamma, rng_critic,
+    )
+    critic_optimizer.update(critic, q_grads)
+
+    # --- actor update ------------------------------------------------------
+    s = z[:, :-1]  # states with a valid "next" transition, same as critic loss
+    pi_grad_fn = nnx.value_and_grad(policy_loss_real, argnums=0, has_aux=True)
+    (_, pi_metrics), pi_grads = pi_grad_fn(policy, critic, temperature, s, rng_actor)
+    policy_optimizer.update(policy, pi_grads)
+
+    # --- temperature (entropy coefficient) update --------------------------
+    temp_grad_fn = nnx.value_and_grad(temperature_loss_real, argnums=0, has_aux=True)
+    (_, temp_metrics), temp_grads = temp_grad_fn(temperature, pi_metrics["log_pi"], target_entropy)
+    temp_optimizer.update(temperature, temp_grads)
+
+    # --- target critic Polyak update ---------------------------------------
+    soft_update(critic_target, critic, tau)
+
+    metrics = {**q_metrics, **temp_metrics}
+    metrics.update({k: v for k, v in pi_metrics.items() if k != "log_pi"})
+    return metrics
+
+@nnx.jit
+def train_step_world_model(
     rssm: RSSM,
     optimizer: nnx.Optimizer,
     images: jax.Array,
@@ -194,7 +391,7 @@ def train_step(
 
 
 @nnx.jit
-def eval_step(
+def eval_step_world_model(
     rssm: RSSM,
     images: jax.Array,
     actions: jax.Array,
@@ -206,6 +403,21 @@ def eval_step(
     _ones = jnp.ones(())
     _, metrics = rssm_loss(rssm, images, actions, rewards, continues,
                            kl_weight, _ones, _ones, free_bits)
+    return metrics
+
+
+@nnx.jit
+def train_step_policy(
+    rssm: RSSM,
+    policy: Policy,
+    optimizer: nnx.Optimizer,
+    start_features: jax.Array,  # (B, features_dim) concat([h, z])
+    horizon: jax.Array,
+    gamma: jax.Array,
+) -> dict[str, jax.Array]:
+    grad_fn = nnx.value_and_grad(policy_loss, has_aux=True)
+    (_, metrics), grads = grad_fn(rssm, policy, start_features, horizon, gamma)
+    optimizer.update(policy, grads)
     return metrics
 
 
@@ -257,7 +469,7 @@ def save_reconstruction_grid(
 def log_reconstruction_images(rssm: RSSM, batch: dict, step: int | str) -> None:
     images = batch["images"]
     actions = batch["actions"]
-    _, out = rssm(images, actions, initial_carry=None, return_carry=True)
+    _, out = rssm.teacher_forcing_forward(images, actions, initial_carry=None, return_carry=True)
     recon       = np.asarray(out["reconstruction"])
     prior_recon = np.asarray(out["prior_reconstruction"])
     step_label = f"{step:06d}" if isinstance(step, int) else step
@@ -282,8 +494,47 @@ def make_checkpoint_manager(
     return ocp.CheckpointManager(directory, options=options)
 
 
-def save_checkpoint(manager: ocp.CheckpointManager, model: RSSM, step: int) -> None:
-    manager.save(step, args=ocp.args.StandardSave(nnx.state(model)))
+def save_checkpoint(
+    manager: ocp.CheckpointManager, models: dict[str, nnx.Module], step: int
+) -> None:
+    """Save every model in *models* (e.g. rssm/policy/critic/...) as one
+    checkpoint step, each under its own named item via ``ocp.args.Composite``
+    so a single ``manager.save``/``restore`` call covers the whole agent."""
+    manager.save(
+        step,
+        args=ocp.args.Composite(
+            **{name: ocp.args.StandardSave(nnx.state(m)) for name, m in models.items()}
+        ),
+    )
+
+
+def load_checkpoint(models: dict[str, nnx.Module], directory: str | Path) -> int:
+    """Restore the latest checkpoint from *directory* into every model in
+    *models* (matched by name) in-place.
+
+    Returns the restored step number, or 0 if no checkpoint was found.
+    """
+    directory = Path(directory).expanduser().resolve()
+    if not directory.exists():
+        print(f"[checkpoint] directory {directory} not found — starting from scratch")
+        return 0
+    manager = ocp.CheckpointManager(
+        directory, options=ocp.CheckpointManagerOptions()
+    )
+    step = manager.latest_step()
+    if step is None:
+        print(f"[checkpoint] no checkpoint in {directory} — starting from scratch")
+        manager.close()
+        return 0
+    restore_args = ocp.args.Composite(
+        **{name: ocp.args.StandardRestore(nnx.state(m)) for name, m in models.items()}
+    )
+    restored = manager.restore(step, args=restore_args)
+    for name, m in models.items():
+        nnx.update(m, restored[name])
+    manager.close()
+    print(f"[checkpoint] loaded step {step} from {directory} ({', '.join(models)})")
+    return step
 
 
 def metrics_to_floats(metrics: dict) -> dict[str, float]:
@@ -310,58 +561,52 @@ if __name__ == "__main__":
     config = dict(
         # env
         action_repeat=3,
-        num_collect_episodes=5,
         max_episode_steps=500,
+        buffer_capacity=500,       # max episodes stored
+        # self-play workers (each owns its own env + calls the inference server)
+        num_workers=8,
+        episodes_per_worker=3,     # collect this many episodes *per worker*, then train
+        max_inference_batch=8,    # inference-server batch size (>= num_workers)
+        # collect / train interleave
+        train_per_collect=400,     # world-model gradient steps per collect phase
+        policy_steps_per_collect=100,  # policy gradient steps per collect phase
+        num_cycles=100,             # total collect→train cycles
         # model
         image_channels=3,
-        action_dim=3,          # CarRacing-v3 continuous: [steering, gas, brake]
+        action_dim=3,              # CarRacing-v3 continuous: [steering, gas, brake]
         memory_dim=256,
         stoch_dim=32,
-        num_gaussian_components=2,
+        num_gaussian_components=8,
         predictor_hidden_dim=256,
+        # policy (SAC)
+        policy_hidden_dim=256,
+        policy_lr=1e-4,
+        q_hidden_dim=256,
+        q_lr=3e-4,
+        alpha_lr=1e-3,
+        init_alpha=0.1,             # initial entropy coefficient (auto-tuned afterwards)
+        target_update_tau=0.005,    # Polyak averaging rate for target critics
+        gamma=0.95,
         # training
         seq_len=50,
-        batch_size=8,
-        train_steps=5000,
-        learning_rate=3e-4,
+        batch_size=16,
+        learning_rate=8e-4,
         grad_clip=100.0,
         kl_weight=1.0,
-        free_bits=1.0,         # nats; per-step KL below this is not penalised
+        free_bits=1.0,
         log_every=50,
-        image_every=500,
-        checkpoint_every=1000,
+        image_every=400,
+        checkpoint_every=800,
+        # set to a checkpoint dir to warm-start the RSSM; None = train from scratch
+        pretrained_rssm="data/checkpoints/hafner_dreamer/rssm",
     )
 
     # ------------------------------------------------------------------
-    # Collect data
+    # Init buffer, model, optimiser
     # ------------------------------------------------------------------
-    print(f"Collecting {config['num_collect_episodes']} episodes …")
-    env = gym.make("CarRacing-v3", render_mode="rgb_array", continuous=True)
     rngs = nnx.Rngs(0, noise=1)
-    buffer = SequenceReplayBuffer(capacity=config["num_collect_episodes"] * 2, rngs=rngs)
+    buffer = SequenceReplayBuffer(capacity=config["buffer_capacity"], rngs=rngs)
 
-    total_steps = 0
-    for ep_idx in range(config["num_collect_episodes"]):
-        images, actions, rewards, continues = collect_episode(
-            env,
-            action_repeat=config["action_repeat"],
-            max_steps=config["max_episode_steps"],
-        )
-        buffer.add_episode(images, actions, rewards, continues)
-        total_steps += images.shape[0]
-        print(
-            f"  episode {ep_idx + 1}: {images.shape[0]} steps, "
-            f"total reward {rewards.sum():.1f}"
-        )
-    env.close()
-    print(f"Buffer: {len(buffer)} episodes, ~{total_steps} steps total.\n")
-
-    # One fixed validation batch (sampled once, reused for visual logging)
-    val_batch = buffer.sample(batch_size=config["batch_size"], seq_len=config["seq_len"])
-
-    # ------------------------------------------------------------------
-    # Model + optimiser
-    # ------------------------------------------------------------------
     rssm = RSSM(
         image_channels=config["image_channels"],
         action_dim=config["action_dim"],
@@ -371,12 +616,15 @@ if __name__ == "__main__":
         predictor_hidden_dim=config["predictor_hidden_dim"],
         rngs=rngs,
     )
+    if config["pretrained_rssm"] is not None:
+        load_checkpoint({"rssm": rssm}, config["pretrained_rssm"])
 
+    total_train_steps = config["num_cycles"] * config["train_per_collect"]
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
         peak_value=config["learning_rate"],
         warmup_steps=200,
-        decay_steps=config["train_steps"],
+        decay_steps=total_train_steps,
     )
     tx = optax.chain(
         # optax.clip_by_global_norm(config["grad_clip"]),
@@ -384,54 +632,249 @@ if __name__ == "__main__":
     )
     optimizer = nnx.Optimizer(rssm, tx, wrt=nnx.Param)
 
-    checkpoint_dir = Path("data/checkpoints/hafner_dreamer/rssm")
+    policy = Policy(
+        features_dim=config["stoch_dim"],
+        hidden_dim=config["policy_hidden_dim"],
+        action_dim=config["action_dim"],
+        rngs=nnx.Rngs(42, noise=43),
+    )
+    policy_optimizer = nnx.Optimizer(policy, optax.adam(config["policy_lr"]), wrt=nnx.Param)
+
+    critic = Critic(
+        features_dim=config["stoch_dim"],
+        action_dim=config["action_dim"],
+        hidden_dim=config["q_hidden_dim"],
+        rngs=nnx.Rngs(44, noise=45),
+    )
+    critic_target = Critic(
+        features_dim=config["stoch_dim"],
+        action_dim=config["action_dim"],
+        hidden_dim=config["q_hidden_dim"],
+        rngs=nnx.Rngs(46, noise=47),
+    )
+    nnx.update(critic_target, nnx.state(critic))  # start target == online critic
+    critic_optimizer = nnx.Optimizer(critic, optax.adam(config["q_lr"]), wrt=nnx.Param)
+
+    temperature = Temperature(initial_alpha=config["init_alpha"])
+    temp_optimizer = nnx.Optimizer(temperature, optax.adam(config["alpha_lr"]), wrt=nnx.Param)
+    target_entropy = jnp.asarray(-float(config["action_dim"]), dtype=jnp.float32)
+
+    gamma = jnp.asarray(config["gamma"], dtype=jnp.float32)
+    tau   = jnp.asarray(config["target_update_tau"], dtype=jnp.float32)
+    sac_rng = jax.random.PRNGKey(7)
+
+    # Everything a checkpoint needs to fully resume the agent (world model +
+    # actor-critic + entropy coefficient) — saved/restored together as one step.
+    all_models = {
+        "rssm": rssm,
+        "policy": policy,
+        "critic": critic,
+        "critic_target": critic_target,
+        "temperature": temperature,
+    }
+
+    checkpoint_dir = Path("data/checkpoints/hafner_dreamer")
     ckpt_manager = make_checkpoint_manager(checkpoint_dir, max_to_keep=3)
 
+    kl_w      = jnp.asarray(config["kl_weight"], dtype=jnp.float32)
+    free_bits = jnp.asarray(config["free_bits"],  dtype=jnp.float32)
+
     # ------------------------------------------------------------------
-    # Training loop
+    # Spawn the inference server + self-play workers
+    # ------------------------------------------------------------------
+    # The server owns a copy of encoder+policy (only what's needed to act);
+    # workers only ever exchange frames/actions with it, never touching the
+    # accelerator or the RSSM/Policy classes themselves.
+    ctx = mp.get_context("spawn")
+    request_queue     = ctx.Queue()
+    weight_queue       = ctx.Queue()
+    result_queue       = ctx.Queue()
+    response_queues    = [ctx.Queue() for _ in range(config["num_workers"])]
+    command_queues     = [ctx.Queue() for _ in range(config["num_workers"])]
+    stop_event  = ctx.Event()
+    ready_event = ctx.Event()
+
+    def sync_target_weights() -> None:
+        """Push the live encoder+policy weights to the inference server."""
+        weight_queue.put(extract_weights(EncoderPolicy(rssm.encoder, policy)))
+
+    remote_model_kwargs = dict(
+        image_channels=config["image_channels"],
+        memory_dim=config["memory_dim"],
+        stoch_dim=config["stoch_dim"],
+        num_gaussian_components=config["num_gaussian_components"],
+        policy_hidden_dim=config["policy_hidden_dim"],
+        action_dim=config["action_dim"],
+    )
+    server = ctx.Process(
+        target=run_inference_server,
+        args=(
+            build_encoder_policy,
+            remote_model_kwargs,
+            request_queue,
+            response_queues,
+            weight_queue,
+            stop_event,
+            ready_event,
+            config["max_inference_batch"],
+        ),
+        daemon=True,
+    )
+    server.start()
+
+    # Seed the server with the live encoder/policy weights and wait until it
+    # is serving before launching workers.
+    sync_target_weights()
+    ready_event.wait()
+
+    sp_config = {
+        "action_repeat": config["action_repeat"],
+        "max_episode_steps": config["max_episode_steps"],
+    }
+    workers = [
+        ctx.Process(
+            target=run_worker,
+            args=(
+                i,
+                command_queues[i],
+                request_queue,
+                response_queues[i],
+                result_queue,
+                stop_event,
+                sp_config,
+            ),
+            daemon=True,
+        )
+        for i in range(config["num_workers"])
+    ]
+    for worker in workers:
+        worker.start()
+
+    # ------------------------------------------------------------------
+    # Collect → train loop
     # ------------------------------------------------------------------
     mlflow.set_experiment("hafner_dreamer")
-    with mlflow.start_run(run_name="rssm_overfit_one_batch", log_system_metrics=True):
-        mlflow.log_params(config)
+    try:
+        with mlflow.start_run(run_name="policy_collect_train", log_system_metrics=True):
+            mlflow.log_params(config)
 
-        kl_w = jnp.asarray(config["kl_weight"], dtype=jnp.float32)
-        free_bits = jnp.asarray(config["free_bits"], dtype=jnp.float32)
+            global_step = 0
+            val_batch   = None
 
-        for step in tqdm(range(1, config["train_steps"] + 1), desc="train"):
-            batch = buffer.sample(
-                batch_size=config["batch_size"], seq_len=config["seq_len"]
-            )
-            metrics = train_step(
-                rssm, optimizer,
-                batch["images"], batch["actions"],
-                batch["rewards"], batch["continues"],
-                kl_w, free_bits,
-            )
+            for cycle in range(1, config["num_cycles"] + 1):
+                # --- collect phase -----------------------------------------
+                # Dispatch a "collect n episodes" command to every worker,
+                # then block until all num_workers * episodes_per_worker
+                # episodes have arrived before starting the train phase.
+                print(f"\n[cycle {cycle}/{config['num_cycles']}] collecting "
+                    f"{config['episodes_per_worker']} episodes x {config['num_workers']} workers …")
+                for command_queue in command_queues:
+                    command_queue.put(("collect", config["episodes_per_worker"]))
 
-            if step % config["log_every"] == 0:
-                mlflow.log_metrics(
-                    {f"train/{k}": v for k, v in metrics_to_floats(metrics).items()},
-                    step=step,
+                expected = config["num_workers"] * config["episodes_per_worker"]
+                ep_rewards, ep_lengths = [], []
+                with tqdm(total=expected, desc=f"collect cycle {cycle}", leave=False) as pbar:
+                    while len(ep_rewards) < expected:
+                        _worker_id, images, actions, rewards, continues = result_queue.get()
+                        buffer.add_episode(images, actions, rewards, continues)
+                        ep_rewards.append(float(rewards.sum()))
+                        ep_lengths.append(int(images.shape[0]))
+                        pbar.update(1)
+
+                collect_stats = {
+                    "collect/ep_reward_mean": float(np.mean(ep_rewards)),
+                    "collect/ep_reward_max":  float(np.max(ep_rewards)),
+                    "collect/ep_reward_min":  float(np.min(ep_rewards)),
+                    "collect/ep_length_mean": float(np.mean(ep_lengths)),
+                    "collect/buffer_size":    float(len(buffer)),
+                }
+                mlflow.log_metrics(collect_stats, step=global_step)
+                print(f"  buffer: {len(buffer)} episodes  |  "
+                      f"reward mean/max: {collect_stats['collect/ep_reward_mean']:.1f} / "
+                      f"{collect_stats['collect/ep_reward_max']:.1f}")
+
+                # Refresh validation batch each cycle so it reflects new data.
+                val_batch = buffer.sample(
+                    batch_size=config["batch_size"], seq_len=config["seq_len"]
                 )
 
-            if step % config["image_every"] == 0:
-                val_metrics = eval_step(
-                    rssm,
-                    val_batch["images"], val_batch["actions"],
-                    val_batch["rewards"], val_batch["continues"],
-                    kl_w, free_bits,
-                )
-                mlflow.log_metrics(
-                    {f"val/{k}": v for k, v in metrics_to_floats(val_metrics).items()},
-                    step=step,
-                )
-                log_reconstruction_images(rssm, val_batch, step)
+                # --- train phase  world model---------------------------------------------
+                for _ in tqdm(range(config["train_per_collect"]),
+                              desc=f"world model train cycle {cycle}", leave=False):
+                    global_step += 1
+                    batch = buffer.sample(
+                        batch_size=config["batch_size"], seq_len=config["seq_len"]
+                    )
+                    metrics = train_step_world_model(
+                        rssm, optimizer,
+                        batch["images"], batch["actions"],
+                        batch["rewards"], batch["continues"],
+                        kl_w, free_bits,
+                    )
 
-            if step % config["checkpoint_every"] == 0:
-                save_checkpoint(ckpt_manager, rssm, step)
+                    if global_step % config["log_every"] == 0:
+                        mlflow.log_metrics(
+                            {f"train/{k}": v
+                             for k, v in metrics_to_floats(metrics).items()},
+                            step=global_step,
+                        )
 
-        log_reconstruction_images(rssm, val_batch, "final")
-        save_checkpoint(ckpt_manager, rssm, config["train_steps"])
-        ckpt_manager.wait_until_finished()
-        mlflow.log_artifacts(str(checkpoint_dir), artifact_path="checkpoints")
-        ckpt_manager.close()
+                    if global_step % config["image_every"] == 0:
+                        val_metrics = eval_step_world_model(
+                            rssm,
+                            val_batch["images"], val_batch["actions"],
+                            val_batch["rewards"], val_batch["continues"],
+                            kl_w, free_bits,
+                        )
+                        mlflow.log_metrics(
+                            {f"val/{k}": v
+                             for k, v in metrics_to_floats(val_metrics).items()},
+                            step=global_step,
+                        )
+                        log_reconstruction_images(rssm, val_batch, global_step)
+
+                    if global_step % config["checkpoint_every"] == 0:
+                        save_checkpoint(ckpt_manager, all_models, global_step)
+
+                # --- train phase  controller (off-policy SAC, real buffer) -----------
+                for _ in tqdm(range(config["policy_steps_per_collect"]),
+                              desc=f"policy train cycle {cycle}", leave=False):
+                    global_step += 1
+                    batch = buffer.sample(
+                        batch_size=config["batch_size"], seq_len=config["seq_len"]
+                    )
+                    sac_rng, step_rng = jax.random.split(sac_rng)
+                    pol_metrics = train_step_sac_real(
+                        rssm, policy, critic, critic_target, temperature,
+                        policy_optimizer, critic_optimizer, temp_optimizer,
+                        batch["images"], batch["actions"],
+                        batch["rewards"], batch["continues"],
+                        gamma, tau, target_entropy, step_rng,
+                    )
+
+                if global_step % config["log_every"] == 0:
+                    mlflow.log_metrics(
+                        {f"sac/{k}": v
+                         for k, v in metrics_to_floats(pol_metrics).items()},
+                        step=global_step,
+                    )
+
+                # Push the freshly-trained encoder+policy to the inference
+                # server so the *next* collect phase uses updated weights.
+                sync_target_weights()
+
+            # Final artefacts
+            if val_batch is not None:
+                log_reconstruction_images(rssm, val_batch, "final")
+            save_checkpoint(ckpt_manager, all_models, global_step)
+            ckpt_manager.wait_until_finished()
+            mlflow.log_artifacts(str(checkpoint_dir), artifact_path="checkpoints")
+            ckpt_manager.close()
+    finally:
+        stop_event.set()
+        for worker in workers:
+            worker.terminate()
+        server.terminate()
+        for worker in workers:
+            worker.join(timeout=5)
+        server.join(timeout=5)
