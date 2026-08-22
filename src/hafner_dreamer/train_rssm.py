@@ -75,6 +75,9 @@ def rssm_loss(
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     _, out = rssm.teacher_forcing_forward(images, actions, initial_carry=None, return_carry=True)
 
+    # images are frame-stacked (image_channels * frame_stack channels) and
+    # the decoder reconstructs the whole stack, so the target is just images
+    # itself — no slicing needed.
     # Reconstruction: compare decoder output (all T frames) against all images.
     recon_loss = jnp.mean((out["reconstruction"] - images) ** 2)
 
@@ -218,6 +221,12 @@ def policy_loss(
     }
 
 
+def _l2_penalty(module: nnx.Module) -> jax.Array:
+    """Sum of squared parameters — plain (coupled) L2 weight decay term."""
+    leaves = jax.tree.leaves(nnx.state(module, nnx.Param))
+    return sum(jnp.sum(jnp.square(p)) for p in leaves)
+
+
 def q_loss_real(
     critic: Critic,
     critic_target: Critic,
@@ -228,6 +237,7 @@ def q_loss_real(
     rewards: Float[jax.Array, "batch seq"],
     continues: Float[jax.Array, "batch seq"],
     gamma: Float[jax.Array, ()],
+    weight_decay: Float[jax.Array, ()],
     rng_key: jax.Array,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     """SAC critic (soft Bellman residual) loss on one-step real transitions.
@@ -248,20 +258,39 @@ def q_loss_real(
 
     # policy.sample already returns a bounded (tanh-squashed) action.
     next_action, next_log_pi = policy.sample(s_next, rng_key=rng_key)
-
     q1_next, q2_next = critic_target(s_next, next_action)
-    q_next = jnp.minimum(q1_next, q2_next) - temperature.value * next_log_pi
+
+    # For a tanh-squashed Gaussian, log π is UNBOUNDED ABOVE: as the policy
+    # learns decisive, near-boundary actions (e.g. flooring the gas once it
+    # can drive well), the tanh change-of-variables correction pushes log π
+    # large-positive, so the soft-target term −α·log π flips from an entropy
+    # *bonus* into a large entropy *penalty* that drags the bootstrapped
+    # target down. With γ≈0.99 this compounds and collapses Q — which is why
+    # reward peaks then craters and the actor loss (−q_min) starts growing.
+    # Clip only the entropy term *in the target* so a transient low-entropy
+    # spike can't sink the critic. The actor and temperature still see the
+    # true (unclipped) log π, so their entropy-restoring signal is intact.
+    q_next = jnp.minimum(q1_next, q2_next) - temperature.value * jnp.clip(next_log_pi, -10.0, 10.0)
     target = jax.lax.stop_gradient(r + gamma * c * q_next)
 
     q1_pred, q2_pred = critic(s, a)
-    loss = jnp.mean((q1_pred - target) ** 2) + jnp.mean((q2_pred - target) ** 2)
+    bellman_loss = jnp.mean((q1_pred - target) ** 2) + jnp.mean((q2_pred - target) ** 2)
+
+    # L2 weight decay on the critic's own params only — keeps Q from
+    # inflating its weights to fit noisy/out-of-distribution bootstrap
+    # targets, a cheap extra guard against the Q-divergence seen previously.
+    l2 = _l2_penalty(critic)
+    loss = bellman_loss + weight_decay * l2
 
     return loss, {
-        "q_loss":      loss,
+        "q_loss":        loss,
+        "q_bellman_loss": bellman_loss,
+        "q_l2":          l2,
         "q1_mean":     jnp.mean(q1_pred),
         "q2_mean":     jnp.mean(q2_pred),
         "target_mean": jnp.mean(target),
         "reward_mean": jnp.mean(r),
+        "next_log_pi": jnp.mean(next_log_pi),
     }
 
 
@@ -280,9 +309,16 @@ def policy_loss_real(
     so its own parameters never receive gradient here — only the policy does.
     """
     # policy.sample already returns a bounded (tanh-squashed) action.
+    # Reparameterised sample: gradients must flow a ~ π(s) → Q(s, a) → policy
+    # params. Do NOT stop_gradient q_min — that would erase the value signal
+    # and leave the actor maximising entropy only (policy_std saturates and
+    # mu parks at the centre → slow, indecisive driving). The critic's own
+    # params are already protected: train_step_sac_real differentiates this
+    # loss w.r.t. the policy only (argnums=0), so critic weights never update
+    # here regardless.
     action, log_pi = policy.sample(features, rng_key=rng_key)
     q1, q2 = critic(features, action)
-    q_min = jax.lax.stop_gradient(jnp.minimum(q1, q2))
+    q_min = jnp.minimum(q1, q2)
 
     alpha = temperature.value
     loss = jnp.mean(alpha * log_pi - q_min)
@@ -320,6 +356,18 @@ def soft_update(target: nnx.Module, source: nnx.Module, tau: jax.Array) -> None:
     nnx.update(target, new_state)
 
 
+def _global_grad_norm(grads) -> jax.Array:
+    """Global L2 norm of a gradient pytree (matches optax.clip_by_global_norm).
+
+    Useful as an early-warning signal: a gradient norm that trends up without
+    bound is the fingerprint of the divergence (KL / mean-Q blow-up) we're
+    chasing here. Computed inside the jitted train step and returned as a
+    metric so it lands in the same MLflow log as the losses.
+    """
+    leaves = jax.tree.leaves(grads)
+    return jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in leaves))
+
+
 @nnx.jit
 def train_step_sac_real(
     rssm: RSSM,
@@ -337,6 +385,7 @@ def train_step_sac_real(
     gamma: jax.Array,
     tau: jax.Array,
     target_entropy: jax.Array,
+    q_weight_decay: jax.Array,
     rng_key: jax.Array,
 ) -> dict[str, jax.Array]:
     """One off-policy SAC update (critic → actor → temperature → target sync)."""
@@ -349,19 +398,22 @@ def train_step_sac_real(
     q_grad_fn = nnx.value_and_grad(q_loss_real, argnums=0, has_aux=True)
     (_, q_metrics), q_grads = q_grad_fn(
         critic, critic_target, policy, temperature,
-        z, actions, rewards, continues, gamma, rng_critic,
+        z, actions, rewards, continues, gamma, q_weight_decay, rng_critic,
     )
+    q_metrics["q_grad_norm"] = _global_grad_norm(q_grads)
     critic_optimizer.update(critic, q_grads)
 
     # --- actor update ------------------------------------------------------
     s = z[:, :-1]  # states with a valid "next" transition, same as critic loss
     pi_grad_fn = nnx.value_and_grad(policy_loss_real, argnums=0, has_aux=True)
     (_, pi_metrics), pi_grads = pi_grad_fn(policy, critic, temperature, s, rng_actor)
+    pi_metrics["policy_grad_norm"] = _global_grad_norm(pi_grads)
     policy_optimizer.update(policy, pi_grads)
 
     # --- temperature (entropy coefficient) update --------------------------
     temp_grad_fn = nnx.value_and_grad(temperature_loss_real, argnums=0, has_aux=True)
     (_, temp_metrics), temp_grads = temp_grad_fn(temperature, pi_metrics["log_pi"], target_entropy)
+    temp_metrics["temp_grad_norm"] = _global_grad_norm(temp_grads)
     temp_optimizer.update(temperature, temp_grads)
 
     # --- target critic Polyak update ---------------------------------------
@@ -386,6 +438,7 @@ def train_step_world_model(
     grad_fn = nnx.value_and_grad(rssm_loss, has_aux=True)
     (_, metrics), grads = grad_fn(rssm, images, actions, rewards, continues,
                                   kl_weight, _ones, _ones, free_bits)
+    metrics["grad_norm"] = _global_grad_norm(grads)
     optimizer.update(rssm, grads)
     return metrics
 
@@ -433,12 +486,21 @@ def save_reconstruction_grid(
     *,
     num_items: int = 4,
     title: str | None = None,
+    image_channels: int | None = None,
 ) -> None:
     """Save a 3-row grid per batch item: real | posterior recon | prior imagination."""
     B = min(inputs.shape[0], num_items)
     T = inputs.shape[1]
     # Pick frames from the T-1 range so all three rows have valid data.
     t_indices = [0, (T - 1) // 2, T - 2]
+
+    # All three tensors may be frame-stacked (image_channels * frame_stack
+    # channels) — imshow only understands 1/3/4 channels, so display just
+    # the current-frame slice (the last image_channels channels) of each.
+    display_channels = image_channels or inputs.shape[-1]
+    real_inputs      = inputs[..., -display_channels:]
+    reconstructions  = reconstructions[..., -display_channels:]
+    prior_recons     = prior_recons[..., -display_channels:]
 
     num_cols = len(t_indices)
     row_labels = ["real", "posterior", "prior"]
@@ -448,7 +510,7 @@ def save_reconstruction_grid(
     for b in range(B):
         for col, t in enumerate(t_indices):
             rows = [
-                inputs[b, t],
+                real_inputs[b, t],
                 reconstructions[b, t],
                 prior_recons[b, t],      # prior_recons is T-1, t < T-1 always
             ]
@@ -477,6 +539,7 @@ def log_reconstruction_images(rssm: RSSM, batch: dict, step: int | str) -> None:
     save_reconstruction_grid(
         np.asarray(images), recon, prior_recon, grid_path,
         title=f"step {step_label}",
+        image_channels=rssm.image_channels,
     )
     mlflow.log_artifact(str(grid_path), artifact_path="recon_images")
 
@@ -562,20 +625,21 @@ if __name__ == "__main__":
         # env
         action_repeat=3,
         max_episode_steps=500,
-        buffer_capacity=500,       # max episodes stored
+        buffer_capacity=1000,       # max episodes stored
         # self-play workers (each owns its own env + calls the inference server)
-        num_workers=8,
+        num_workers=16,
         episodes_per_worker=3,     # collect this many episodes *per worker*, then train
-        max_inference_batch=8,    # inference-server batch size (>= num_workers)
+        max_inference_batch=16,    # inference-server batch size (>= num_workers)
         # collect / train interleave
-        train_per_collect=400,     # world-model gradient steps per collect phase
-        policy_steps_per_collect=100,  # policy gradient steps per collect phase
-        num_cycles=100,             # total collect→train cycles
+        train_per_collect=200,     # world-model gradient steps per collect phase
+        policy_steps_per_collect=50,  # policy gradient steps per collect phase
+        num_cycles=200,             # total collect→train cycles
         # model
         image_channels=3,
+        frame_stack=3,             # encoder sees the last N frames stacked as channels
         action_dim=3,              # CarRacing-v3 continuous: [steering, gas, brake]
         memory_dim=256,
-        stoch_dim=32,
+        stoch_dim=256,
         num_gaussian_components=8,
         predictor_hidden_dim=256,
         # policy (SAC)
@@ -583,10 +647,20 @@ if __name__ == "__main__":
         policy_lr=1e-4,
         q_hidden_dim=256,
         q_lr=3e-4,
+        q_weight_decay=1e-4,   # L2 penalty on critic params, added directly to q_loss_real
         alpha_lr=1e-3,
-        init_alpha=0.1,             # initial entropy coefficient (auto-tuned afterwards)
+        init_alpha=1./5.,             # initial entropy coefficient (auto-tuned afterwards)
+        # SAC entropy target (desired -E[log π]). The textbook heuristic
+        # -action_dim (=-3) asks for a *near-deterministic* policy; but with a
+        # tanh-squashed action "low entropy" is reached by pushing mass into
+        # the flat tanh tails, i.e. actions pinned at the box boundaries
+        # (full-lock steering ⇒ the car spins in a circle). Empirically log π
+        # then climbs to ~+3 and reward collapses into that circling attractor.
+        # Target ~0 keeps the policy stochastic (log π ≈ 0), preserving
+        # exploration instead of annealing α → 0 and saturating.
+        target_entropy=0.0,
         target_update_tau=0.005,    # Polyak averaging rate for target critics
-        gamma=0.95,
+        gamma=0.99,
         # training
         seq_len=50,
         batch_size=16,
@@ -597,8 +671,11 @@ if __name__ == "__main__":
         log_every=50,
         image_every=400,
         checkpoint_every=800,
-        # set to a checkpoint dir to warm-start the RSSM; None = train from scratch
-        pretrained_rssm="data/checkpoints/hafner_dreamer/rssm",
+        # Full-agent resume from data/checkpoints/hafner_dreamer (below) is
+        # automatic and always tried first. This is only a fallback for
+        # warm-starting *just* the RSSM from a separate world-model-only
+        # checkpoint dir when there's nothing to resume yet; None = skip it.
+        pretrained_rssm=None,
     )
 
     # ------------------------------------------------------------------
@@ -614,32 +691,15 @@ if __name__ == "__main__":
         stoch_dim=config["stoch_dim"],
         num_gaussian_components=config["num_gaussian_components"],
         predictor_hidden_dim=config["predictor_hidden_dim"],
+        frame_stack=config["frame_stack"],
         rngs=rngs,
     )
-    if config["pretrained_rssm"] is not None:
-        load_checkpoint({"rssm": rssm}, config["pretrained_rssm"])
-
-    total_train_steps = config["num_cycles"] * config["train_per_collect"]
-    schedule = optax.warmup_cosine_decay_schedule(
-        init_value=0.0,
-        peak_value=config["learning_rate"],
-        warmup_steps=200,
-        decay_steps=total_train_steps,
-    )
-    tx = optax.chain(
-        # optax.clip_by_global_norm(config["grad_clip"]),
-        optax.adam(schedule),
-    )
-    optimizer = nnx.Optimizer(rssm, tx, wrt=nnx.Param)
-
     policy = Policy(
         features_dim=config["stoch_dim"],
         hidden_dim=config["policy_hidden_dim"],
         action_dim=config["action_dim"],
         rngs=nnx.Rngs(42, noise=43),
     )
-    policy_optimizer = nnx.Optimizer(policy, optax.adam(config["policy_lr"]), wrt=nnx.Param)
-
     critic = Critic(
         features_dim=config["stoch_dim"],
         action_dim=config["action_dim"],
@@ -653,15 +713,7 @@ if __name__ == "__main__":
         rngs=nnx.Rngs(46, noise=47),
     )
     nnx.update(critic_target, nnx.state(critic))  # start target == online critic
-    critic_optimizer = nnx.Optimizer(critic, optax.adam(config["q_lr"]), wrt=nnx.Param)
-
     temperature = Temperature(initial_alpha=config["init_alpha"])
-    temp_optimizer = nnx.Optimizer(temperature, optax.adam(config["alpha_lr"]), wrt=nnx.Param)
-    target_entropy = jnp.asarray(-float(config["action_dim"]), dtype=jnp.float32)
-
-    gamma = jnp.asarray(config["gamma"], dtype=jnp.float32)
-    tau   = jnp.asarray(config["target_update_tau"], dtype=jnp.float32)
-    sac_rng = jax.random.PRNGKey(7)
 
     # Everything a checkpoint needs to fully resume the agent (world model +
     # actor-critic + entropy coefficient) — saved/restored together as one step.
@@ -674,7 +726,54 @@ if __name__ == "__main__":
     }
 
     checkpoint_dir = Path("data/checkpoints/hafner_dreamer")
+
+    # Resume the *whole* agent (rssm + policy + critic(s) + temperature) from
+    # the latest checkpoint in checkpoint_dir, if one exists — this is what
+    # "continue training the saved model" restores. World-model and policy
+    # steps are tracked separately (they advance at different rates:
+    # train_per_collect vs policy_steps_per_collect per cycle), so each metric
+    # family lands on its own clean x-axis in MLflow. Checkpoints are keyed by
+    # the world-model step, so wm_step resumes from the checkpoint step and
+    # policy_step is derived from it via the per-cycle ratio so the sac/* curve
+    # continues at a sensible position too. Falls back to warm-starting *only*
+    # the RSSM from `pretrained_rssm` when there's nothing to resume yet.
+    #
+    # Caveat: only model *parameters* are checkpointed, not optimizer state
+    # (Adam's m/v moments, step count) — so on resume, the world-model LR
+    # schedule restarts its warmup/decay from a fresh optimizer, and Adam's
+    # momentum rebuilds from zero for a few steps. Usually a minor blip
+    # given the short 200-step warmup; ask if you want optimizer state
+    # checkpointed too for a fully seamless resume.
+    wm_step = load_checkpoint(all_models, checkpoint_dir)
+    if wm_step == 0 and config["pretrained_rssm"] is not None:
+        load_checkpoint({"rssm": rssm}, config["pretrained_rssm"])
+    policy_step = (
+        wm_step * config["policy_steps_per_collect"] // config["train_per_collect"]
+    )
+
     ckpt_manager = make_checkpoint_manager(checkpoint_dir, max_to_keep=3)
+
+    total_train_steps = config["num_cycles"] * config["train_per_collect"]
+    schedule = optax.warmup_cosine_decay_schedule(
+        init_value=0.0,
+        peak_value=config["learning_rate"],
+        warmup_steps=200,
+        decay_steps=total_train_steps,
+    )
+    tx = optax.chain(
+        # optax.clip_by_global_norm(config["grad_clip"]),
+        optax.adam(schedule),
+    )
+    optimizer = nnx.Optimizer(rssm, tx, wrt=nnx.Param)
+    policy_optimizer = nnx.Optimizer(policy, optax.adam(config["policy_lr"]), wrt=nnx.Param)
+    critic_optimizer = nnx.Optimizer(critic, optax.adam(config["q_lr"]), wrt=nnx.Param)
+    temp_optimizer = nnx.Optimizer(temperature, optax.adam(config["alpha_lr"]), wrt=nnx.Param)
+    target_entropy = jnp.asarray(float(config["target_entropy"]), dtype=jnp.float32)
+
+    gamma = jnp.asarray(config["gamma"], dtype=jnp.float32)
+    tau   = jnp.asarray(config["target_update_tau"], dtype=jnp.float32)
+    q_weight_decay = jnp.asarray(config["q_weight_decay"], dtype=jnp.float32)
+    sac_rng = jax.random.PRNGKey(7)
 
     kl_w      = jnp.asarray(config["kl_weight"], dtype=jnp.float32)
     free_bits = jnp.asarray(config["free_bits"],  dtype=jnp.float32)
@@ -705,6 +804,7 @@ if __name__ == "__main__":
         num_gaussian_components=config["num_gaussian_components"],
         policy_hidden_dim=config["policy_hidden_dim"],
         action_dim=config["action_dim"],
+        frame_stack=config["frame_stack"],
     )
     server = ctx.Process(
         target=run_inference_server,
@@ -730,6 +830,7 @@ if __name__ == "__main__":
     sp_config = {
         "action_repeat": config["action_repeat"],
         "max_episode_steps": config["max_episode_steps"],
+        "frame_stack": config["frame_stack"],
     }
     workers = [
         ctx.Process(
@@ -757,9 +858,25 @@ if __name__ == "__main__":
     try:
         with mlflow.start_run(run_name="policy_collect_train", log_system_metrics=True):
             mlflow.log_params(config)
+            if wm_step > 0:
+                print(f"[resume] continuing from wm_step={wm_step}, policy_step={policy_step}")
+            mlflow.log_param("resumed_from_wm_step", wm_step)
+            mlflow.log_param("resumed_from_policy_step", policy_step)
 
-            global_step = 0
-            val_batch   = None
+            val_batch = None
+            # Image/checkpoint cadence is keyed off the world-model step and
+            # uses a threshold (fire when >= N steps elapsed since the last
+            # event) rather than exact ``wm_step % N == 0`` so nothing is
+            # skipped after resuming at an unaligned offset.
+            last_image_step = wm_step
+            last_ckpt_step  = wm_step
+
+            def _save_and_upload_checkpoint(step: int) -> None:
+                save_checkpoint(ckpt_manager, all_models, step)
+                ckpt_manager.wait_until_finished()
+                # Upload incrementally so a later divergence/crash/kill doesn't
+                # lose everything — the end-of-run upload alone is too fragile.
+                mlflow.log_artifacts(str(checkpoint_dir), artifact_path="checkpoints")
 
             for cycle in range(1, config["num_cycles"] + 1):
                 # --- collect phase -----------------------------------------
@@ -788,7 +905,7 @@ if __name__ == "__main__":
                     "collect/ep_length_mean": float(np.mean(ep_lengths)),
                     "collect/buffer_size":    float(len(buffer)),
                 }
-                mlflow.log_metrics(collect_stats, step=global_step)
+                mlflow.log_metrics(collect_stats, step=policy_step)
                 print(f"  buffer: {len(buffer)} episodes  |  "
                       f"reward mean/max: {collect_stats['collect/ep_reward_mean']:.1f} / "
                       f"{collect_stats['collect/ep_reward_max']:.1f}")
@@ -800,8 +917,8 @@ if __name__ == "__main__":
 
                 # --- train phase  world model---------------------------------------------
                 for _ in tqdm(range(config["train_per_collect"]),
-                              desc=f"world model train cycle {cycle}", leave=False):
-                    global_step += 1
+                            desc=f"world model train cycle {cycle}", leave=False):
+                    wm_step += 1
                     batch = buffer.sample(
                         batch_size=config["batch_size"], seq_len=config["seq_len"]
                     )
@@ -812,14 +929,15 @@ if __name__ == "__main__":
                         kl_w, free_bits,
                     )
 
-                    if global_step % config["log_every"] == 0:
+                    if wm_step % config["log_every"] == 0:
                         mlflow.log_metrics(
                             {f"train/{k}": v
-                             for k, v in metrics_to_floats(metrics).items()},
-                            step=global_step,
+                            for k, v in metrics_to_floats(metrics).items()},
+                            step=wm_step,
                         )
 
-                    if global_step % config["image_every"] == 0:
+                    if wm_step - last_image_step >= config["image_every"]:
+                        last_image_step = wm_step
                         val_metrics = eval_step_world_model(
                             rssm,
                             val_batch["images"], val_batch["actions"],
@@ -828,18 +946,19 @@ if __name__ == "__main__":
                         )
                         mlflow.log_metrics(
                             {f"val/{k}": v
-                             for k, v in metrics_to_floats(val_metrics).items()},
-                            step=global_step,
+                            for k, v in metrics_to_floats(val_metrics).items()},
+                            step=wm_step,
                         )
-                        log_reconstruction_images(rssm, val_batch, global_step)
+                        log_reconstruction_images(rssm, val_batch, wm_step)
 
-                    if global_step % config["checkpoint_every"] == 0:
-                        save_checkpoint(ckpt_manager, all_models, global_step)
+                    if wm_step - last_ckpt_step >= config["checkpoint_every"]:
+                        last_ckpt_step = wm_step
+                        _save_and_upload_checkpoint(wm_step)
 
                 # --- train phase  controller (off-policy SAC, real buffer) -----------
                 for _ in tqdm(range(config["policy_steps_per_collect"]),
                               desc=f"policy train cycle {cycle}", leave=False):
-                    global_step += 1
+                    policy_step += 1
                     batch = buffer.sample(
                         batch_size=config["batch_size"], seq_len=config["seq_len"]
                     )
@@ -849,15 +968,15 @@ if __name__ == "__main__":
                         policy_optimizer, critic_optimizer, temp_optimizer,
                         batch["images"], batch["actions"],
                         batch["rewards"], batch["continues"],
-                        gamma, tau, target_entropy, step_rng,
+                        gamma, tau, target_entropy, q_weight_decay, step_rng,
                     )
 
-                if global_step % config["log_every"] == 0:
-                    mlflow.log_metrics(
-                        {f"sac/{k}": v
-                         for k, v in metrics_to_floats(pol_metrics).items()},
-                        step=global_step,
-                    )
+                    if policy_step % config["log_every"] == 0:
+                        mlflow.log_metrics(
+                            {f"sac/{k}": v
+                             for k, v in metrics_to_floats(pol_metrics).items()},
+                            step=policy_step,
+                        )
 
                 # Push the freshly-trained encoder+policy to the inference
                 # server so the *next* collect phase uses updated weights.
@@ -866,9 +985,8 @@ if __name__ == "__main__":
             # Final artefacts
             if val_batch is not None:
                 log_reconstruction_images(rssm, val_batch, "final")
-            save_checkpoint(ckpt_manager, all_models, global_step)
-            ckpt_manager.wait_until_finished()
-            mlflow.log_artifacts(str(checkpoint_dir), artifact_path="checkpoints")
+            if wm_step != last_ckpt_step:
+                _save_and_upload_checkpoint(wm_step)
             ckpt_manager.close()
     finally:
         stop_event.set()

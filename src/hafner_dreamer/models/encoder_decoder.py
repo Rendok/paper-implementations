@@ -72,7 +72,8 @@ class ResidualDownsampleBlock(nnx.Module):
 class ResidualUpsampleBlock(nnx.Module):
   """ResNet-style block with optional upsampling on the first transpose conv."""
 
-  def __init__(self, in_features: int, out_features: int, kernel_size: tuple[int, int], strides: tuple[int, int], *, rngs: nnx.Rngs):
+  def __init__(self, in_features: int, out_features: int, kernel_size: tuple[int, int], strides: tuple[int, int], *, rngs: nnx.Rngs, final: bool = False):
+    self.final = final
     self.conv1 = nnx.ConvTranspose(
         in_features=in_features,
         out_features=out_features,
@@ -106,7 +107,8 @@ class ResidualUpsampleBlock(nnx.Module):
     residual = x if self.skip is None else self.skip(x)
     x = nnx.relu(self.conv1(x))
     x = self.conv2(x)
-    return nnx.relu(x + residual)
+    out = x + residual
+    return out if self.final else nnx.relu(out)
 
 
 class MDNEncoder(nnx.Module):
@@ -153,7 +155,7 @@ class MDNDecoder(nnx.Module):
     self.conv1 = ResidualUpsampleBlock(in_features=256, out_features=128, kernel_size=(4, 4), strides=(2, 2), rngs=rngs)
     self.conv2 = ResidualUpsampleBlock(in_features=128, out_features=64, kernel_size=(4, 4), strides=(2, 2), rngs=rngs)
     self.conv3 = ResidualUpsampleBlock(in_features=64, out_features=32, kernel_size=(4, 4), strides=(2, 2), rngs=rngs)
-    self.conv4 = ResidualUpsampleBlock(in_features=32, out_features=out_dim, kernel_size=(4, 4), strides=(2, 2), rngs=rngs)
+    self.conv4 = ResidualUpsampleBlock(in_features=32, out_features=out_dim, kernel_size=(4, 4), strides=(2, 2), rngs=rngs, final=True)
 
   def __call__(
       self, z: Float[Array, "... latent_dim"]

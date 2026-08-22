@@ -104,6 +104,8 @@ class Policy(nnx.Module):
         """
         mu, _ = self._mu_and_std(features)
         return self._squash(mu)
+        # raise NotImplementedError("Disabled to make less bugs.")
+        
 
     def sample(
         self,
@@ -232,7 +234,7 @@ class EncoderPolicy(nnx.Module):
     ) -> Float[Array, "... action_dim"]:
         frame = frame.astype(jnp.float32) / 255.0
         z, _, _, _ = self.encoder(frame)
-        return self.policy(z)
+        return self.policy.sample(z)[0]
 
 
 def build_encoder_policy(
@@ -244,6 +246,7 @@ def build_encoder_policy(
     policy_hidden_dim: int,
     action_dim: int,
     rngs: nnx.Rngs,
+    frame_stack: int = 1,
 ) -> EncoderPolicy:
     """Build a fresh ``EncoderPolicy`` from plain dimension kwargs.
 
@@ -251,11 +254,16 @@ def build_encoder_policy(
     ``model_fn`` — pass this function itself (not a pre-built instance) so
     the inference-server process constructs its own encoder/policy weights
     locally; real weights are synced afterwards via ``weight_queue``.
+
+    ``frame_stack`` must match the ``RSSM``'s own ``frame_stack`` — the
+    encoder built here needs the same input channel count
+    (``image_channels * frame_stack``) since callers (self-play workers)
+    send it the same stacked-frame observations used for training.
     """
     from encoder_decoder import MDNEncoder  # local import: keep this module RSSM-independent otherwise
 
     encoder = MDNEncoder(
-        in_dim=image_channels,
+        in_dim=image_channels * frame_stack,
         latent_dim=stoch_dim,
         memory_dim=memory_dim,
         num_gaussian_components=num_gaussian_components,

@@ -78,9 +78,16 @@ class SequenceReplayBuffer:
         key = self.rngs.noise()
         k1, k2 = jax.random.split(key)
         ep_idx = np.asarray(jax.random.randint(k1, (batch_size,), 0, len(valid)))
+        # One independent key per sample: reusing a single key here makes
+        # jax.random.randint deterministic per (key, range), so equal-length
+        # episodes would get identical start offsets — collapsing start
+        # diversity and replaying the same sub-sequences.
+        start_keys = jax.random.split(k2, batch_size)
         starts = np.array([
-            int(jax.random.randint(k2, (), 0, valid[i]["images"].shape[0] - seq_len + 1))
-            for i in ep_idx
+            int(jax.random.randint(
+                start_keys[b], (), 0, valid[ep_idx[b]]["images"].shape[0] - seq_len + 1
+            ))
+            for b in range(batch_size)
         ])
 
         slices = [

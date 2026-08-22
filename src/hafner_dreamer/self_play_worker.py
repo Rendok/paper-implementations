@@ -17,6 +17,7 @@ whole batch of fresh episodes has arrived before starting a training phase.
 from __future__ import annotations
 
 import sys
+from collections import deque
 from pathlib import Path
 
 # Expose the shared inference-server module (sibling package under src/).
@@ -34,6 +35,33 @@ def preprocess_frame(frame: np.ndarray) -> np.ndarray:
     """Resize a (H, W, 3) uint8 frame to IMAGE_SIZE uint8."""
     img = Image.fromarray(frame).resize(IMAGE_SIZE, Image.BILINEAR)
     return np.asarray(img, dtype=np.uint8)
+
+
+class FrameStacker:
+    """Stacks the last ``frame_stack`` single frames along the channel axis.
+
+    Gives the encoder a short motion history (velocity/direction cues a
+    single static frame can't convey) instead of just the current frame.
+    At episode start, missing history frames are zeros — ``reset()`` fills
+    the buffer with ``frame_stack - 1`` all-zero frames so the very first
+    real frame already produces a full-width (H, W, C*frame_stack) stack.
+    """
+
+    def __init__(self, frame_stack: int, frame_shape: tuple[int, int, int]) -> None:
+        self.frame_stack = frame_stack
+        self.frame_shape = frame_shape
+        self._history: deque[np.ndarray] = deque(maxlen=frame_stack)
+        self.reset()
+
+    def reset(self) -> None:
+        self._history.clear()
+        for _ in range(self.frame_stack - 1):
+            self._history.append(np.zeros(self.frame_shape, dtype=np.uint8))
+
+    def push(self, frame: np.ndarray) -> np.ndarray:
+        """Add the newest frame and return the current (H, W, C*frame_stack) stack."""
+        self._history.append(frame)
+        return np.concatenate(list(self._history), axis=-1)
 
 
 class RemotePolicy:
@@ -71,47 +99,61 @@ def collect_episode(
     *,
     action_repeat: int = 2,
     max_steps: int = 1000,
+    frame_stack: int = 3,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Collect one episode using the remote policy.
 
-    At each step: preprocess the latest frame, query the remote policy for a
-    bounded (tanh-squashed) action, repeat the action *action_repeat* times,
-    and record the result. Exploration comes from the SAC policy's own
-    stochasticity (max-entropy objective) — no separate ε-greedy noise. The
-    action stored in the buffer is exactly the one applied to the env
-    (already in-bounds), so the critic/world model see the same bounded
-    actions the policy produces.
+    At each step: preprocess the latest frame and stack it with the
+    ``frame_stack - 1`` previous frames along the channel axis (zeros for
+    any missing history at episode start), query the remote policy for a
+    bounded (tanh-squashed) action from that stacked observation, repeat the
+    action *action_repeat* times, and record the result. Exploration comes
+    from the SAC policy's own stochasticity (max-entropy objective) — no
+    separate ε-greedy noise. The action stored in the buffer is exactly the
+    one applied to the env (already in-bounds), so the critic/world model
+    see the same bounded actions the policy produces.
 
     Returns
     -------
-    images   : uint8  (T, 64, 64, 3)
+    images   : uint8  (T, 64, 64, 3*frame_stack) — frame-stacked observations
     actions  : float32 (T, action_dim)
     rewards  : float32 (T,)
     continues: float32 (T,)   1 = episode not done, 0 = done
     """
     obs, _ = env.reset()
     images, actions, rewards, continues = [], [], [], []
+    stacker = FrameStacker(frame_stack, (*IMAGE_SIZE, 3))
 
     done = False
     step = 0
     while not done and step < max_steps:
         frame = preprocess_frame(obs)
+        stacked_frame = stacker.push(frame)
 
-        action = remote_policy.act(frame)
+        action = remote_policy.act(stacked_frame)
 
         total_reward = 0.0
         last_obs = obs
+        terminated = False
+        truncated = False
         for _ in range(action_repeat):
             last_obs, r, terminated, truncated, _ = env.step(action)
             total_reward += r
-            done = terminated or truncated
-            if done:
+            if terminated or truncated:
                 break
+        done = terminated or truncated
 
-        images.append(frame)
+        images.append(stacked_frame)
         actions.append(action)
         rewards.append(float(total_reward))
-        continues.append(0.0 if done else 1.0)
+        # continue=0 ONLY for a true MDP terminal (terminated). A time-limit
+        # truncation is an artificial cutoff, not a zero-value absorbing
+        # state, so we must still bootstrap (continue=1). Marking truncated
+        # steps as continue=0 teaches the critic that good, late-episode
+        # states have zero future value — which drags Q down precisely as the
+        # policy starts surviving to the time limit, making reward grow then
+        # collapse.
+        continues.append(0.0 if terminated else 1.0)
         obs = last_obs
         step += 1
 
@@ -170,6 +212,7 @@ def run_worker(
                         env, remote_policy,
                         action_repeat=sp_config["action_repeat"],
                         max_steps=sp_config["max_episode_steps"],
+                        frame_stack=sp_config["frame_stack"],
                     )
                     result_queue.put((worker_id, images, actions, rewards, continues))
             elif kind == "stop":

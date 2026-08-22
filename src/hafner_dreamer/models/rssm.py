@@ -90,26 +90,36 @@ class RSSM(nnx.Module):
         stoch_dim: int,
         num_gaussian_components: int,
         predictor_hidden_dim: int = 256,
+        frame_stack: int = 1,
         *,
         rngs: nnx.Rngs,
     ):
         self.memory_dim = memory_dim
         self.stoch_dim = stoch_dim
         self.action_dim = action_dim
+        # image_channels is always the single-frame channel count (e.g. 3 for
+        # RGB) — both the encoder input and decoder output see the full
+        # frame_stack*image_channels stack: the encoder needs the history for
+        # motion/velocity cues a static frame can't convey, and the decoder
+        # reconstructs the whole stack so the same tensor shape flows through
+        # unchanged (images in == images out, no slicing needed elsewhere).
+        self.image_channels = image_channels
+        self.frame_stack = frame_stack
         self.rngs = rngs
 
         features_dim = memory_dim + stoch_dim
+        stacked_channels = image_channels * frame_stack
 
         # RNN receives concat(prev_stoch, action) at each step.
         self.cell = nnx.LSTMCell(in_features=stoch_dim + action_dim, hidden_features=memory_dim, rngs=rngs)
         self.encoder = MDNEncoder(
-            in_dim=image_channels,
+            in_dim=stacked_channels,
             latent_dim=stoch_dim,
             memory_dim=memory_dim,
             num_gaussian_components=num_gaussian_components,
             rngs=rngs,
         )
-        self.decoder = MDNDecoder(latent_dim=stoch_dim, out_dim=image_channels, rngs=rngs)
+        self.decoder = MDNDecoder(latent_dim=stoch_dim, out_dim=stacked_channels, rngs=rngs)
         self.prior = DynamicPredictor(
             in_dim=memory_dim,
             stoch_dim=stoch_dim,
@@ -244,6 +254,12 @@ class RSSM(nnx.Module):
     ):
         """Pure imagination: encode one real frame → z_0, then roll forward with
         the prior for T steps using the provided actions.
+
+        ``first_frame`` must already have ``image_channels * frame_stack``
+        channels (i.e. the same frame-history stack the encoder was trained
+        on), not a single raw frame — callers are responsible for building
+        that stack (zero-padding history at episode start), same as during
+        data collection.
 
         Returns T imagined frames plus latent trajectory.  No KL computation.
         """

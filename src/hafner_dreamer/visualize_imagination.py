@@ -29,32 +29,41 @@ import gymnasium as gym
 
 from rssm import RSSM
 from controller import Policy
+from self_play_worker import preprocess_frame, FrameStacker, IMAGE_SIZE
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def preprocess_frame(frame: np.ndarray, image_size: tuple[int, int]) -> np.ndarray:
-    img = Image.fromarray(frame).resize(image_size, Image.BILINEAR)
-    return np.asarray(img, dtype=np.uint8)
-
-
-def collect_episode(env, rssm: RSSM, policy: Policy, *, action_repeat: int = 3, horizon: int = 100):
+def collect_episode(
+    env, rssm: RSSM, policy: Policy, *, action_repeat: int = 3, horizon: int = 100, frame_stack: int = 3,
+):
     """Collect up to *horizon* steps acting greedily with the trained policy.
 
-    At each step: encode the current frame to z, take the policy's
-    deterministic squashed-mean action (already inside the env's valid box
-    — no clipping needed), and repeat it *action_repeat* times.
+    At each step: stack the current frame with the ``frame_stack - 1``
+    previous frames along the channel axis (zeros for missing history at
+    episode start — matching self-play collection via :class:`FrameStacker`),
+    encode that stack to z, take the policy's deterministic squashed-mean
+    action (already inside the env's valid box — no clipping needed), and
+    repeat it *action_repeat* times.
+
+    Returns
+    -------
+    real_frames   : uint8  (T, H, W, 3)               — single frames, for display only
+    stacked_frames: uint8  (T, H, W, 3*frame_stack)    — what the encoder actually saw
+    actions       : float32 (T, action_dim)
     """
-    image_size = (64, 64)
     obs, _ = env.reset()
-    real_frames, actions = [], []
+    real_frames, stacked_frames, actions = [], [], []
+    stacker = FrameStacker(frame_stack, (*IMAGE_SIZE, 3))
     done = False
     while not done and len(real_frames) < horizon:
-        frame = preprocess_frame(obs, image_size)
-        frame_jax = jnp.asarray(frame[None] / 255.0, dtype=jnp.float32)  # (1, H, W, C)
-        z, _, _, _ = rssm.encoder(frame_jax)
+        frame = preprocess_frame(obs)
+        stacked_frame = stacker.push(frame)
+
+        stacked_jax = jnp.asarray(stacked_frame[None] / 255.0, dtype=jnp.float32)  # (1, H, W, C)
+        z, _, _, _ = rssm.encoder(stacked_jax)
         action = np.asarray(policy(z), dtype=np.float32)[0]
 
         for _ in range(action_repeat):
@@ -63,8 +72,9 @@ def collect_episode(env, rssm: RSSM, policy: Policy, *, action_repeat: int = 3, 
             if done:
                 break
         real_frames.append(frame)
+        stacked_frames.append(stacked_frame)
         actions.append(action)
-    return np.stack(real_frames), np.stack(actions)
+    return np.stack(real_frames), np.stack(stacked_frames), np.stack(actions)
 
 
 def load_models(checkpoint_path: str, rssm_config: dict, policy_config: dict) -> tuple[RSSM, Policy]:
@@ -81,6 +91,7 @@ def load_models(checkpoint_path: str, rssm_config: dict, policy_config: dict) ->
         stoch_dim=rssm_config["stoch_dim"],
         num_gaussian_components=rssm_config["num_gaussian_components"],
         predictor_hidden_dim=rssm_config["predictor_hidden_dim"],
+        frame_stack=rssm_config["frame_stack"],
         rngs=nnx.Rngs(0, noise=1),
     )
     policy = Policy(
@@ -142,16 +153,17 @@ def make_strip(*panels: np.ndarray) -> np.ndarray:
 
 def main():
     checkpoint  = "data/checkpoints/hafner_dreamer"
-    horizon     = 80
+    horizon     = 300
     out_path    = Path("data/hafner_dreamer/imagination.gif")
     fps         = 10
     action_repeat = 3
 
     model_config = dict(
         image_channels=3,
+        frame_stack=3,
         action_dim=3,
         memory_dim=256,
-        stoch_dim=32,
+        stoch_dim=256, # 32
         num_gaussian_components=8,
         predictor_hidden_dim=256,
     )
@@ -163,28 +175,32 @@ def main():
     # --- collect real episode, acting with the trained policy ---
     print("Collecting real episode …")
     env = gym.make("CarRacing-v3", render_mode="rgb_array", continuous=True)
-    real_frames_u8, actions = collect_episode(
-        env, rssm, policy, action_repeat=action_repeat, horizon=horizon
+    real_frames_u8, stacked_frames_u8, actions = collect_episode(
+        env, rssm, policy, action_repeat=action_repeat, horizon=horizon,
+        frame_stack=model_config["frame_stack"],
     )
     env.close()
     T = len(actions)
     print(f"  collected {T} steps")
 
-    # Shared JAX inputs
-    all_frames  = jnp.asarray(real_frames_u8 / 255.0, dtype=jnp.float32)  # (T, H, W, C)
-    first_frame = all_frames[:1][np.newaxis]   # encoder expects (batch, H, W, C) → (1, H, W, C)
-    # add batch dim: (1, T, H, W, C) and (1, T, A)
-    all_frames_b = all_frames[np.newaxis]
+    # Shared JAX inputs — encoder expects frame-stacked (H, W, C*frame_stack)
+    # observations, matching what it saw during self-play collection.
+    all_frames_b = jnp.asarray(stacked_frames_u8 / 255.0, dtype=jnp.float32)[np.newaxis]  # (1, T, H, W, C)
+    first_frame  = all_frames_b[:, 0]   # (1, H, W, C) — already includes zero-padded history
     actions_jax  = jnp.asarray(actions[np.newaxis], dtype=jnp.float32)
 
-    # --- direct reconstruction: encode every real frame, decode straight back ---
+    # --- direct reconstruction: encode every real (stacked) frame, decode straight back ---
     post_stoch, _, _, _ = rssm.encoder(all_frames_b[0])   # (T, D)
-    recon_frames = np.asarray(rssm.decoder(post_stoch))    # (T, H, W, C)
+    recon_frames = np.asarray(rssm.decoder(post_stoch))    # (T, H, W, C*frame_stack) — full stack reconstruction
+    # Decoder reconstructs the whole stack; only display the current-frame
+    # slice (last image_channels channels) for a plain RGB comparison.
+    recon_frames = recon_frames[..., -rssm.image_channels:]
     recon_u8 = np.clip(recon_frames * 255, 0, 255).astype(np.uint8)
 
     # --- imagination: seed from z_0, roll forward with prior ---
-    _, out = rssm.autoregressive_forward(first_frame[0], actions_jax, return_carry=True)
-    imagined = np.asarray(out["imagined_frames"][0])       # (T, H, W, C)
+    _, out = rssm.autoregressive_forward(first_frame, actions_jax, return_carry=True)
+    imagined = np.asarray(out["imagined_frames"][0])       # (T, H, W, C*frame_stack)
+    imagined = imagined[..., -rssm.image_channels:]
     imagined_u8 = np.clip(imagined * 255, 0, 255).astype(np.uint8)
 
     real_64 = real_frames_u8   # already 64×64 from preprocess_frame
