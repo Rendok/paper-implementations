@@ -129,11 +129,13 @@ class DiT(nnx.Module):
         assert config.hidden_dim % config.num_q_heads == 0
         assert config.num_q_heads % config.num_kv_heads == 0
 
+        self.config = config
+
         self.image_embedder = image_embedder
         self.time_embedder = TimeEmbedding(config.hidden_dim, dtype=config.comp_dtype)
 
         self.class_embeddings = nnx.Embed(
-            config.num_classes + 1,
+            config.num_classes,
             config.hidden_dim,
             rngs=rngs,
             dtype=config.comp_dtype,

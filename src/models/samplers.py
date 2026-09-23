@@ -6,7 +6,7 @@ from jaxtyping import Array, Float, Integer
 from typing import Tuple
 
 
-@ft.partial(nnx.jit, static_argnames=("comp_dtype",))
+@ft.partial(nnx.jit, static_argnames=("comp_dtype", "data_range"))
 def stochastic_sampler_step(
     model: nnx.Module,
     x: Float[Array, "batch H W C"],
@@ -84,3 +84,70 @@ def stochastic_sampler(
         )
 
     return x
+
+
+@ft.partial(nnx.jit, static_argnames=("comp_dtype", "data_range"))
+def euler_sampler_step(
+    model: nnx.Module,
+    x: Float[Array, "batch H W C"],
+    t: Float[Array, ""],
+    classes: Integer[Array, "batch"],
+    dt: Float[Array, ""],
+    comp_dtype: jnp.dtype = jnp.bfloat16,
+    data_range: float = 1.0,
+) -> Float[Array, "batch H W C"]:
+    t_b = jnp.broadcast_to(t, (x.shape[0],))
+    v = model(x.astype(comp_dtype), t_b, classes).astype(jnp.float32)
+    return x + v * dt
+
+
+def euler_sampler(
+    model: nnx.Module,
+    batch_size: int,
+    image_shape: Tuple[int, int, int],
+    classes: Integer[Array, "batch"],
+    *,
+    rngs: nnx.Rngs,
+    num_steps: int = 200,
+    sigma: float = 0.5,
+    t_min: float = 1e-2,      # the velocity's 1/t factor is singular at t=0
+    t_max: float = 1.0 - 1e-3,  # score ~ 1/(1-t) is singular at t=1
+    comp_dtype: jnp.dtype = jnp.bfloat16,
+    data_range: float = 1.0,
+    guidance_strength: float = 4.0,
+):
+    """Integrate the interpolant SDE from noise (t=0) to data (t=1).
+    Assumes ``model`` predicts eps, so the score is s = -eps_hat / (1 - t).
+    """
+    step_size = (t_max - t_min) / num_steps
+    dt = jnp.asarray(step_size, jnp.float32)
+
+    x = rngs.normal((batch_size, *image_shape), dtype=jnp.float32)
+
+    for i in range(num_steps):
+        t = jnp.asarray(t_min + i * step_size, jnp.float32)
+        x = classifier_free_sampler_step(
+            model, x, t, classes, dt,
+            comp_dtype=comp_dtype, data_range=data_range,
+            guidance_strength=guidance_strength,
+        )
+
+    return x
+
+
+@ft.partial(nnx.jit, static_argnames=("comp_dtype", "data_range", "guidance_strength"))
+def classifier_free_sampler_step(
+    model: nnx.Module,
+    x: Float[Array, "batch H W C"],
+    t: Float[Array, ""],
+    classes: Integer[Array, "batch"],
+    dt: Float[Array, ""],
+    comp_dtype: jnp.dtype = jnp.bfloat16,
+    data_range: float = 1.0,
+    guidance_strength: float = 4.0
+) -> Float[Array, "batch H W C"]:
+    t_b = jnp.broadcast_to(t, (x.shape[0],))
+    v = guidance_strength * model(x.astype(comp_dtype), t_b, classes).astype(jnp.float32)
+    empty = jnp.full_like(classes, model.class_embeddings.num_embeddings - 1)
+    v = v + (1 - guidance_strength) * model(x.astype(comp_dtype), t_b, empty).astype(jnp.float32)
+    return x + v * dt

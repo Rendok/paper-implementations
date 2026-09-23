@@ -5,6 +5,7 @@ from pathlib import Path
 import grain
 import jax
 import jax.numpy as jnp
+from absl import flags
 import functools as ft
 import matplotlib.pyplot as plt
 import mlflow
@@ -18,7 +19,15 @@ from datasets import load_dataset
 
 from tokenizers.linear_embedder import LinearEmbedder, LinearEmbedderConfig
 from models.dit import DiT, DiTConfig
-from models.samplers import stochastic_sampler
+from models.samplers import stochastic_sampler, euler_sampler
+
+# When mp_prefetch spawns workers, grain reads the absl flag
+# --grain_enable_multiprocess_worker_profiling (grain/_src/core/profiler.py).
+# Launching with plain `python` never parses absl flags, so that read raises
+# UnparsedFlagAccessError. Marking them parsed resolves every absl flag to its
+# default, which is all grain wants here. Module level, not inside train(), so
+# spawned workers re-running this import are covered too.
+flags.FLAGS.mark_as_parsed()
 
 # MLflow's default tracking URI is sqlite:///<cwd>/mlflow.db — resolved against
 # the *current working directory*. Launching this script from src/training_scripts
@@ -46,6 +55,8 @@ class TrainConfig:
     warmup_steps: int
     learning_rate: float
     adaptive_grad_clip_threshold: float
+    guidance_dropout_prob: float  # CFG
+    guidance_scale: float
     dit_config: DiTConfig
     emb_config: LinearEmbedderConfig
     batch_size: int
@@ -115,7 +126,7 @@ def save_sample_grid(
 def log_sample_images(model: nnx.Module, train_config: TrainConfig, step: int) -> None:
     """Sample from the model and log the grid to mlflow as an artifact."""
     batch_size = train_config.eval_batch_size
-    samples = stochastic_sampler(
+    samples = euler_sampler(
         model,
         batch_size,
         train_config.emb_config.imgage_size,
@@ -125,6 +136,7 @@ def log_sample_images(model: nnx.Module, train_config: TrainConfig, step: int) -
         num_steps=train_config.eval_num_steps,
         sigma=train_config.eval_sigma,
         comp_dtype=train_config.dit_config.comp_dtype,
+        guidance_strength=train_config.guidance_scale,
     )
 
     # Training data lives in [-1, 1]; map back to [0, 1] for display.
@@ -158,8 +170,6 @@ def score_matching_loss_fn(
     loss = jnp.mean(
         optax.l2_loss(eps_hat.astype(jnp.float32), noise.astype(jnp.float32))
     )
-    # Predicting eps_hat = 0 costs 0.5*E[eps^2] = 0.5, so a loss at or above
-    # 0.5 means the model has not learned anything beyond the mean.
     return loss, {"l2_loss": loss, "eps_pred_std": jnp.std(eps_hat.astype(jnp.float32))}
 
 
@@ -168,18 +178,27 @@ def flow_model_loss_fn(
     z: Float[Array, "batch H W C"],
     labels: Integer[Array, "batch"],
     rngs: nnx.Rngs,
+    dropout_prob: float,
+    empty_token_id: int,
 ):
+    "With CFG."
     t = rngs.uniform((z.shape[0],), jnp.float32, 0, 1)
     noise = rngs.normal(z.shape, z.dtype)
     t_b = t.astype(z.dtype)[:, None, None, None]
     x_t = t_b * z + (1 - t_b) * noise
 
+    p = rngs.uniform((z.shape[0],), jnp.bfloat16, 0, 1)
+    labels = jnp.where(p > dropout_prob, labels, empty_token_id)
+
     u_target = z - noise
     loss = jnp.mean(
-        optax.l2_loss(model(x_t, t, labels).astype(jnp.float32), u_target.astype(jnp.float32))
+        optax.l2_loss(
+            model(x_t, t, labels).astype(jnp.float32), u_target.astype(jnp.float32)
+        )
     )
 
     return loss, {"l2_loss": loss}
+
 
 @nnx.jit
 def train_step(
@@ -189,12 +208,21 @@ def train_step(
     labels: Integer[Array, "batch"],
     rngs: nnx.Rngs,
 ):
-    grads, metrics = nnx.grad(score_matching_loss_fn, has_aux=True)(model, z, labels, rngs)
+    grads, metrics = nnx.grad(
+        ft.partial(
+            flow_model_loss_fn,
+            dropout_prob=0.3,
+            empty_token_id=model.class_embeddings.num_embeddings - 1,
+        ),
+        has_aux=True,
+    )(model, z, labels, rngs)
 
     grads_leaves = jax.tree_util.tree_leaves(nnx.state(grads))
-    print(f'{grads_leaves[0].dtype = }')
-    metrics['grad_norm'] = jnp.sqrt(sum([jnp.vdot(g, g) for g in grads_leaves if g is not None]))
-    
+    print(f"{grads_leaves[0].dtype = }")
+    metrics["grad_norm"] = jnp.sqrt(
+        sum([jnp.vdot(g, g) for g in grads_leaves if g is not None])
+    )
+
     optimizer.update(model, grads)
 
     return metrics
@@ -205,10 +233,27 @@ def train(train_config):
     ### Dataset ###
 
     hf_dataset = load_dataset("ylecun/mnist")  # size=28x28
+    # hf_dataset = load_dataset("ILSVRC/imagenet-1k")  # size=28x28
     hf_train, hf_test = hf_dataset["train"], hf_dataset["test"]
 
-    dataset = grain.MapDataset.source(hf_train).shuffle(seed=42).map(to_numpy)
+    dataset = (
+        grain.MapDataset.source(hf_train)
+        .shuffle(seed=42)
+        .map(to_numpy)
+        .repeat()
+        .to_iter_dataset()
+        .batch(train_config.batch_size)
+    )
+
     # print(dataset[1])
+
+    performance_config = grain.experimental.pick_performance_config(
+        ds=dataset, ram_budget_mb=1024, max_workers=None, max_buffer_size=None
+    )
+
+    dataset = dataset.mp_prefetch(
+        performance_config.multiprocessing_options,
+    )
 
     ### Model ###
 
@@ -226,7 +271,7 @@ def train(train_config):
 
     optimizer = optax.chain(
         optax.adaptive_grad_clip(clipping=train_config.adaptive_grad_clip_threshold),
-        optax.adamw(lr_schedule)
+        optax.adamw(lr_schedule),
     )
 
     optimizer = nnx.Optimizer(dit, optimizer, wrt=nnx.Param)
@@ -237,16 +282,22 @@ def train(train_config):
 
     ### Trian ###
 
-    data_iter = iter(dataset.repeat().to_iter_dataset().batch(train_config.batch_size))
+    data_iter = iter(dataset)
 
     setup_mlflow("dit")
-    with mlflow.start_run(run_name="dit_mnist_fp32", log_system_metrics=True):
+    with mlflow.start_run(run_name="dit_mnist_cfg", log_system_metrics=True):
         mlflow.log_params(config_to_params(train_config))
 
         for i in tqdm(range(1, train_config.total_steps + 1)):
+            #     if i == 2:
+            #         jax.profiler.start_trace("/tmp/profile-data")
+
+            #     with jax.profiler.StepTraceAnnotation("train", step_num=i):
+            #         with jax.profiler.TraceAnnotation("data_load"):
             batch = next(data_iter)
             x = jnp.asarray(batch["image"], dtype=train_config.dit_config.comp_dtype)
             labels = jnp.asarray(batch["label"], dtype=jnp.int32)
+
             metrics = train_step(dit, optimizer, x, labels, rngs)
 
             if i % train_config.log_every == 0:
@@ -261,25 +312,28 @@ def train(train_config):
             if i % train_config.eval_every == 0 or i == train_config.total_steps:
                 log_sample_images(dit, train_config, i)
 
+        # jax.block_until_ready(metrics)
+        # jax.profiler.stop_trace()
+
 
 if __name__ == "__main__":
     dit_config = DiTConfig(
-        num_classes=10,
+        num_classes=11,
         max_seq_len=49,
         num_layers=8,
         num_q_heads=12,
         num_kv_heads=6,
         hidden_dim=768,
-        comp_dtype=jnp.float32,
-        param_dtype=jnp.float32,
+        comp_dtype=jnp.bfloat16,
+        param_dtype=jnp.bfloat16,
     )
 
     emb_config = LinearEmbedderConfig(
         imgage_size=(28, 28, 1),
         patch_size=4,
         hidden_dim=768,
-        comp_dtype=jnp.float32,
-        param_dtype=jnp.float32,
+        comp_dtype=jnp.bfloat16,
+        param_dtype=jnp.bfloat16,
     )
 
     train_config = TrainConfig(
@@ -287,10 +341,12 @@ if __name__ == "__main__":
         warmup_steps=500,
         learning_rate=3e-4,
         adaptive_grad_clip_threshold=0.01,
+        guidance_dropout_prob=0.3,
+        guidance_scale=4.0,
         batch_size=128,
         log_every=10,
         eval_every=500,
-        eval_batch_size=10,
+        eval_batch_size=11,
         eval_num_steps=200,
         eval_sigma=0.1,
         eval_seed=1234,
