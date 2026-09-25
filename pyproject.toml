@@ -14,7 +14,9 @@ dependencies = [
     "flax>=0.12.6",
     "grain>=0.2.16",
     "gymnasium[box2d]>=1.2.3",
-    "jax[cuda13]>=0.9.2",
+    # 0.11.2 renamed jax.experimental.hijax.HiPrimitive -> HiPrim, which flax
+    # 0.12.9 still imports. Lift once a flax release catches up.
+    "jax[cuda13]>=0.9.2,<0.11.2",
     "jaxtyping>=0.3.9",
     "magiccube>=1.2.0",
     "matplotlib>=3.10.8",

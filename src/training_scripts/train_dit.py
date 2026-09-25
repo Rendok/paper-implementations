@@ -16,6 +16,7 @@ from flax import nnx
 from jaxtyping import Array, Float, Integer
 
 from datasets import load_dataset
+from PIL import Image
 
 from tokenizers.linear_embedder import LinearEmbedder, LinearEmbedderConfig
 from models.dit import DiT, DiTConfig
@@ -68,8 +69,18 @@ class TrainConfig:
     eval_seed: int
 
 
-def to_numpy(sample: dict) -> dict:
-    image = np.asarray(sample["image"], dtype=np.float32)[..., None] / 255.0
+def to_numpy(sample: dict, *, size: int) -> dict:
+    # Imagenette images are 160px on the short side with varying width, and a
+    # few ImageNet files are grayscale or CMYK, so normalize mode and shape
+    # before batching.
+    image = sample["image"].convert("RGB")
+    w, h = image.size
+    side = min(w, h)
+    left, top = (w - side) // 2, (h - side) // 2
+    image = image.crop((left, top, left + side, top + side)).resize(
+        (size, size), Image.Resampling.BICUBIC
+    )
+    image = np.asarray(image, dtype=np.float32) / 255.0
     sample["image"] = image * 2.0 - 1.0  # [-1, 1]
     return sample
 
@@ -232,20 +243,25 @@ def train(train_config):
 
     ### Dataset ###
 
-    hf_dataset = load_dataset("ylecun/mnist")  # size=28x28
-    # hf_dataset = load_dataset("ILSVRC/imagenet-1k")  # size=28x28
-    hf_train, hf_test = hf_dataset["train"], hf_dataset["test"]
+    # hf_dataset = load_dataset("ylecun/mnist")  # size=28x28
+    # Imagenette: 10 ImageNet classes (tench, English springer, cassette player,
+    # chain saw, church, French horn, garbage truck, gas pump, golf ball,
+    # parachute), labels 0-9, ~107 MB. imagenet-1k itself can't be fetched per
+    # class: its parquet shards mix all 1000 classes, so any class filter still
+    # downloads the full ~150 GB.
+    hf_dataset = load_dataset("ShaomuTan/imagenette")
+    hf_train, hf_test = hf_dataset["train"], hf_dataset["validation"]
 
     dataset = (
         grain.MapDataset.source(hf_train)
         .shuffle(seed=42)
-        .map(to_numpy)
+        .map(ft.partial(to_numpy, size=train_config.emb_config.imgage_size[0]))
         .repeat()
         .to_iter_dataset()
         .batch(train_config.batch_size)
     )
 
-    # print(dataset[1])
+    # print(dataset)
 
     performance_config = grain.experimental.pick_performance_config(
         ds=dataset, ram_budget_mb=1024, max_workers=None, max_buffer_size=None
@@ -285,7 +301,7 @@ def train(train_config):
     data_iter = iter(dataset)
 
     setup_mlflow("dit")
-    with mlflow.start_run(run_name="dit_mnist_cfg", log_system_metrics=True):
+    with mlflow.start_run(run_name="dit_imagenet_10_cfg", log_system_metrics=True):
         mlflow.log_params(config_to_params(train_config))
 
         for i in tqdm(range(1, train_config.total_steps + 1)):
@@ -319,25 +335,25 @@ def train(train_config):
 if __name__ == "__main__":
     dit_config = DiTConfig(
         num_classes=11,
-        max_seq_len=49,
-        num_layers=8,
+        max_seq_len=(64 // 4) ** 2,  # (image side / patch_size)^2 tokens
+        num_layers=12,
         num_q_heads=12,
-        num_kv_heads=6,
+        num_kv_heads=4,
         hidden_dim=768,
         comp_dtype=jnp.bfloat16,
-        param_dtype=jnp.bfloat16,
+        param_dtype=jnp.float32,
     )
 
     emb_config = LinearEmbedderConfig(
-        imgage_size=(28, 28, 1),
+        imgage_size=(64, 64, 3),
         patch_size=4,
         hidden_dim=768,
         comp_dtype=jnp.bfloat16,
-        param_dtype=jnp.bfloat16,
+        param_dtype=jnp.float32,
     )
 
     train_config = TrainConfig(
-        total_steps=20_000,
+        total_steps=100_000,
         warmup_steps=500,
         learning_rate=3e-4,
         adaptive_grad_clip_threshold=0.01,

@@ -46,8 +46,10 @@ class DiTBlock(nnx.Module):
             rngs=rngs,
             dtype=config.comp_dtype,
             param_dtype=config.param_dtype,
+            broadcast_dropout=False,
             use_bias=False,
             decode=False,
+            deterministic=True,
         )
 
         self.rms_norm2 = nnx.RMSNorm(
